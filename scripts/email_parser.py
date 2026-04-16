@@ -22,16 +22,19 @@ IMAP_HOST = "imap.naver.com"
 IMAP_PORT = 993
 
 # 실제 발신자 이메일 주소 기반 매핑
+# 쿠팡 주문확인 이메일은 제외 (배송알림이지 결제알림이 아님)
+# 결제 알림은 나이스정보통신/토스페이먼츠/헥토파이낸셜에서 옴
 SENDER_PATTERNS = {
     "BC카드": ["bcbill@bccard.com", "bccard.com"],
     "카카오뱅크": ["no-reply@mail.kakaobank.com", "kakaobank.com"],
     "현대카드": ["admin@hyundaicard.com", "hyundaicard.com"],
-    "IBK기업은행": ["ibk.co.kr", "기업은행"],
+    "IBK기업은행": ["ibk.co.kr"],
     "네이버페이": ["naverpayadmin_noreply@navercorp.com"],
     "토스페이먼츠": ["bill@bill-mail.tosspayments.com", "tosspayments.com"],
     "나이스정보통신": ["nice_customer@nicepg.co.kr"],
     "헥토파이낸셜": ["noreply@hecto.co.kr"],
-    "쿠팡": ["no_reply@coupang.com", "noreply@e.coupang.com"],
+    # 쿠팡 직접 이메일은 제외 (주문확인 메일 - 금액 파싱 부정확)
+    # "쿠팡": ["no_reply@coupang.com", "noreply@e.coupang.com"],
 }
 
 # 청구/결제 관련 IMAP 폴더 (받은편지함 + 스마트메일함)
@@ -114,19 +117,54 @@ def parse_amount(text):
     return None
 
 
-def parse_transaction_type(text):
+def parse_transaction_type(text, source=None):
     """입금/출금 구분"""
+    # 결제 PG사(나이스정보통신, 토스페이먼츠, 헥토파이낸셜)는 항상 출금
+    if source in ["나이스정보통신", "토스페이먼츠", "헥토파이낸셜", "네이버페이"]:
+        if "취소" in text or "환불" in text:
+            return "입금"
+        return "출금"
     for keyword in INCOME_KEYWORDS:
         if keyword in text:
             return "입금"
     for keyword in EXPENSE_KEYWORDS:
         if keyword in text:
             return "출금"
-    return "기타"
+    return "출금"  # 기본값을 출금으로
 
 
 def parse_merchant(text, source):
     """가맹점/내역 추출"""
+    # 나이스정보통신: "㈜쿠팡에서 결제하신" 형태
+    if "나이스" in source:
+        match = re.search(r'([^\s]+(?:주식회사|㈜|㈜)?[^\s]+)(?:에서|에서의)\s*결제', text)
+        if match:
+            return match.group(1).strip()[:50]
+        match = re.search(r'님,\s*(.+?)에서\s*결제', text)
+        if match:
+            return match.group(1).strip()[:50]
+
+    # 토스페이먼츠: "xxx에서 결제한 내역"
+    if "토스" in source:
+        match = re.search(r'님,\s*(.+?)에서\s*결제한', text)
+        if match:
+            return match.group(1).strip()[:50]
+
+    # 헥토파이낸셜: "xxx에서 결제하신"
+    if "헥토" in source:
+        match = re.search(r'\(주\)([^\s]+)에서', text)
+        if match:
+            return match.group(1).strip()[:50]
+        match = re.search(r'님,\s*(.+?)에서', text)
+        if match:
+            return match.group(1).strip()[:50]
+
+    # 네이버페이
+    if "네이버" in source:
+        match = re.search(r'결제처[:\s]*([^\n\r]+)', text)
+        if match:
+            return match.group(1).strip()[:50]
+
     # 카카오뱅크
     if "카카오" in source:
         match = re.search(r'(?:가맹점|결제처|내역)[:\s]*([^\n\r]+)', text)
@@ -142,6 +180,12 @@ def parse_merchant(text, source):
     # 기업은행
     if "IBK" in source or "기업" in source:
         match = re.search(r'(?:내용|적요)[:\s]*([^\n\r]+)', text)
+        if match:
+            return match.group(1).strip()[:50]
+
+    # 현대카드
+    if "현대" in source:
+        match = re.search(r'(?:가맹점|사용처|이용내역)[:\s]*([^\n\r]+)', text)
         if match:
             return match.group(1).strip()[:50]
 
@@ -225,7 +269,7 @@ def process_emails(mail, email_tuples):
             if not amount:
                 continue
 
-            tx_type = parse_transaction_type(full_text)
+            tx_type = parse_transaction_type(full_text, source)
             merchant = parse_merchant(full_text, source)
             category = guess_category(merchant, tx_type)
 
