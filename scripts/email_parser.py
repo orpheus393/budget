@@ -21,12 +21,25 @@ GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")  # JSON 문자열
 IMAP_HOST = "imap.naver.com"
 IMAP_PORT = 993
 
-# 발신자 패턴 (은행/카드사 알림 이메일)
+# 실제 발신자 이메일 주소 기반 매핑
 SENDER_PATTERNS = {
+    "BC카드": ["bcbill@bccard.com", "bccard.com"],
+    "카카오뱅크": ["no-reply@mail.kakaobank.com", "kakaobank.com"],
+    "현대카드": ["admin@hyundaicard.com", "hyundaicard.com"],
     "IBK기업은행": ["ibk.co.kr", "기업은행"],
-    "BC카드": ["bccard.com", "BC카드"],
-    "카카오뱅크": ["kakaobank.com", "카카오뱅크"],
+    "네이버페이": ["naverpayadmin_noreply@navercorp.com"],
+    "토스페이먼츠": ["bill@bill-mail.tosspayments.com", "tosspayments.com"],
+    "나이스정보통신": ["nice_customer@nicepg.co.kr"],
+    "헥토파이낸셜": ["noreply@hecto.co.kr"],
+    "쿠팡": ["no_reply@coupang.com", "noreply@e.coupang.com"],
 }
+
+# 청구/결제 관련 IMAP 폴더 (받은편지함 + 스마트메일함)
+IMAP_FOLDERS = [
+    "INBOX",
+    "&zK2tbAC3rLDIHA-",   # 청구/결제 폴더
+    "&yPy7OA-|&vDDBoQ-",  # 네이버페이 등
+]
 
 # ── 금액 파싱 정규식 ───────────────────────────────────
 AMOUNT_PATTERNS = [
@@ -157,19 +170,36 @@ def guess_category(merchant, tx_type):
 
 
 def fetch_new_emails(mail, hours=2):
-    """최근 N시간 이내 알림 이메일 가져오기"""
-    mail.select("INBOX")
+    """여러 폴더에서 최근 N시간 이내 알림 이메일 가져오기"""
+    all_emails = []  # (folder, email_id) 튜플 목록
     since = (datetime.now() - timedelta(hours=hours)).strftime("%d-%b-%Y")
-    _, data = mail.search(None, f'(SINCE "{since}")')
-    email_ids = data[0].split()
-    return email_ids
+
+    for folder in IMAP_FOLDERS:
+        try:
+            status, _ = mail.select(f'"{folder}"', readonly=True)
+            if status != 'OK':
+                continue
+            _, data = mail.search(None, f'(SINCE "{since}")')
+            ids = data[0].split()
+            for eid in ids:
+                all_emails.append((folder, eid))
+        except Exception as e:
+            print(f"폴더 {folder} 오류: {e}")
+
+    return all_emails
 
 
-def process_emails(mail, email_ids):
+def process_emails(mail, email_tuples):
     """이메일 파싱 → 거래 목록 반환"""
     transactions = []
+    seen = set()
 
-    for eid in email_ids:
+    for folder, eid in email_tuples:
+        try:
+            mail.select(f'"{folder}"', readonly=True)
+        except:
+            continue
+        for eid in [eid]:
         _, msg_data = mail.fetch(eid, "(RFC822)")
         msg = email.message_from_bytes(msg_data[0][1])
 
@@ -281,9 +311,9 @@ def save_to_sheets(transactions):
 def main():
     print(f"[{datetime.now()}] 이메일 파싱 시작...")
     mail = connect_imap()
-    email_ids = fetch_new_emails(mail, hours=2)
-    print(f"검색된 이메일: {len(email_ids)}개")
-    transactions = process_emails(mail, email_ids)
+    email_tuples = fetch_new_emails(mail, hours=2)
+    print(f"검색된 이메일: {len(email_tuples)}개 (전체 폴더 합계)")
+    transactions = process_emails(mail, email_tuples)
     print(f"파싱된 거래: {len(transactions)}개")
     mail.logout()
     save_to_sheets(transactions)
