@@ -191,62 +191,67 @@ def fetch_new_emails(mail, hours=2):
 
 def process_emails(mail, email_tuples):
     """이메일 파싱 → 거래 목록 반환"""
+    from email.utils import parsedate_to_datetime
     transactions = []
-    seen = set()
+    current_folder = None
 
     for folder, eid in email_tuples:
         try:
-            mail.select(f'"{folder}"', readonly=True)
-        except:
+            # 폴더가 바뀔 때만 select
+            if folder != current_folder:
+                mail.select(f'"{folder}"', readonly=True)
+                current_folder = folder
+
+            _, msg_data = mail.fetch(eid, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+
+            sender = decode_str(msg.get("From", ""))
+            subject = decode_str(msg.get("Subject", ""))
+            date_str = msg.get("Date", "")
+
+            # 발신자 확인 (은행/카드사만)
+            source = None
+            for name, patterns in SENDER_PATTERNS.items():
+                if any(p.lower() in sender.lower() for p in patterns):
+                    source = name
+                    break
+            if not source:
+                continue
+
+            body = get_email_body(msg)
+            full_text = subject + " " + body
+
+            amount = parse_amount(full_text)
+            if not amount:
+                continue
+
+            tx_type = parse_transaction_type(full_text)
+            merchant = parse_merchant(full_text, source)
+            category = guess_category(merchant, tx_type)
+
+            # 날짜 파싱
+            try:
+                dt = parsedate_to_datetime(date_str)
+                tx_date = dt.strftime("%Y-%m-%d")
+                tx_time = dt.strftime("%H:%M")
+            except Exception:
+                tx_date = datetime.now().strftime("%Y-%m-%d")
+                tx_time = ""
+
+            transactions.append({
+                "날짜": tx_date,
+                "시간": tx_time,
+                "출처": source,
+                "유형": tx_type,
+                "금액": amount,
+                "내역": merchant,
+                "카테고리": category,
+                "원문": subject[:100],
+            })
+
+        except Exception as e:
+            print(f"이메일 처리 오류 (folder={folder}, eid={eid}): {e}")
             continue
-        for eid in [eid]:
-        _, msg_data = mail.fetch(eid, "(RFC822)")
-        msg = email.message_from_bytes(msg_data[0][1])
-
-        sender = decode_str(msg.get("From", ""))
-        subject = decode_str(msg.get("Subject", ""))
-        date_str = msg.get("Date", "")
-
-        # 발신자 확인 (은행/카드사만)
-        source = None
-        for name, patterns in SENDER_PATTERNS.items():
-            if any(p in sender for p in patterns):
-                source = name
-                break
-        if not source:
-            continue
-
-        body = get_email_body(msg)
-        full_text = subject + " " + body
-
-        amount = parse_amount(full_text)
-        if not amount:
-            continue
-
-        tx_type = parse_transaction_type(full_text)
-        merchant = parse_merchant(full_text, source)
-        category = guess_category(merchant, tx_type)
-
-        # 날짜 파싱
-        try:
-            from email.utils import parsedate_to_datetime
-            dt = parsedate_to_datetime(date_str)
-            tx_date = dt.strftime("%Y-%m-%d")
-            tx_time = dt.strftime("%H:%M")
-        except Exception:
-            tx_date = datetime.now().strftime("%Y-%m-%d")
-            tx_time = ""
-
-        transactions.append({
-            "날짜": tx_date,
-            "시간": tx_time,
-            "출처": source,
-            "유형": tx_type,
-            "금액": amount,
-            "내역": merchant,
-            "카테고리": category,
-            "원문": subject[:100],
-        })
 
     return transactions
 
