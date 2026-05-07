@@ -302,10 +302,6 @@ def process_emails(mail, email_tuples):
 
 def save_to_sheets(transactions):
     """Google Sheets에 저장"""
-    if not transactions:
-        print("새로운 거래 없음")
-        return
-
     import json
     import tempfile
 
@@ -324,6 +320,11 @@ def save_to_sheets(transactions):
     os.unlink(creds_path)
 
     sheet = gc.open_by_key(GOOGLE_SHEET_ID)
+    print(f"📊 Google Sheet: {sheet.title} → {sheet.url}")
+
+    if not transactions:
+        print("새로운 거래 없음")
+        return
 
     # 시트 선택 또는 생성
     try:
