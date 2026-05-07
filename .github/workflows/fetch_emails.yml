@@ -8,6 +8,7 @@ on:
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: 코드 체크아웃
@@ -17,9 +18,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: 의존성 설치
-        run: pip install gspread google-auth imaplib2
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'gspread>=6.0.0' 'google-auth>=2.28.0'
 
       - name: 이메일 파싱 실행
         env:
