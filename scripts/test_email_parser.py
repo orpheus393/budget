@@ -18,10 +18,12 @@ from email_parser import (
     strip_html,
     imap_utf7_encode,
     is_statement_email,
+    is_non_transaction_subject,
     normalize_statement_date,
     normalize_statement_amount,
     parse_statement_table,
     parse_statement_text,
+    _is_amount_token,
     AD_FOLDER,
     SHOPPING_FOLDER,
     NEWSLETTER_FOLDER,
@@ -248,6 +250,53 @@ assert_eq(bc_txs[3]["금액"], 6500, "bc row3 amount")
 merchants = [t["내역"] for t in bc_txs]
 for skipped in ["휴대폰메시지", "(본인)", "소계", "합계"]:
     assert_eq(any(skipped in m for m in merchants), False, f"bc skipped {skipped}")
+
+# ── 안내성 메일 사전 차단 ──
+assert_eq(is_non_transaction_subject("위험자산 한도초과 안내"), True, "non-tx 위험자산")
+assert_eq(is_non_transaction_subject("[안내] 약관 변경"), True, "non-tx 약관")
+assert_eq(is_non_transaction_subject("결제 알림"), False, "non-tx 결제")
+assert_eq(is_non_transaction_subject(""), False, "non-tx empty")
+
+# ── _is_amount_token: 할부개월/회차 같은 1~3자리 정수 제외 ──
+assert_eq(_is_amount_token("12,345"), True, "amount 콤마")
+assert_eq(_is_amount_token("-12,345"), True, "amount 음수 콤마")
+assert_eq(_is_amount_token("0"), True, "amount 0")
+assert_eq(_is_amount_token("12345"), True, "amount 5자리 무콤마")
+assert_eq(_is_amount_token("5"), False, "amount 단자리 (할부개월)")
+assert_eq(_is_amount_token("12"), False, "amount 두자리 (회차)")
+assert_eq(_is_amount_token("123"), False, "amount 세자리 (애매하지만 제외)")
+assert_eq(_is_amount_token("옥션"), False, "amount 한글")
+assert_eq(_is_amount_token("(1,500)"), True, "amount 괄호")
+
+# ── parse_statement_text: BC카드 실제 라인 포맷 (한 줄에 여러 숫자) ──
+# "옥션 라인": 이용금액 379,440 / 할부5개월 / 2회차 / 원금 75,888 / 수수료 0 / 면제 / 할인 0 / 잔액 227,664
+# 첫 비-0 amount = 379,440 (이용금액). 5/2는 할부개월/회차로 무시.
+bc_line_text = """이용일자  가맹점명           이용금액
+02/10 옥션 379,440 5 2 75,888 0 면제 0 227,664
+04/04 또와요짬뽕 47,000 0 0 0
+03/22 마트할인 -1,891 -1,891 0 -1,891 0
+02/05 휴대폰메시지(승인안내)-02월분 면제 0 0 0
+03/26 3대째 소문난 순대국 30,000 0 0 0
+04/04 영화할인 -8,000 -8,000 0 -8,000 0
+"""
+bc_line_txs = parse_statement_text(bc_line_text, 2026, 4)
+# 기대: 옥션, 또와요짬뽕, 마트할인, 3대째 소문난 순대국, 영화할인 — 5건 (휴대폰면제 0원 제외)
+assert_eq(len(bc_line_txs), 5, "bc text row count (5 valid)")
+# 옥션은 첫 비-0 amount = 이용금액 379,440 (잔액 227,664이 아님)
+opp = next(t for t in bc_line_txs if t["내역"].startswith("옥션"))
+assert_eq(opp["내역"], "옥션", "bc text 옥션 merchant only (5/2 metadata 제외)")
+assert_eq(opp["금액"], 379440, "bc text 옥션 이용금액 (잔액 X)")
+# 또와요짬뽕 일시불
+ttwa = next(t for t in bc_line_txs if "또와요" in t["내역"])
+assert_eq(ttwa["금액"], 47000, "bc text 또와요짬뽕 금액")
+# 음수 거래
+mart = next(t for t in bc_line_txs if t["내역"] == "마트할인")
+assert_eq(mart["유형"], "입금", "bc text 마트할인 = 입금")
+assert_eq(mart["금액"], 1891, "bc text 마트할인 절대값")
+# 다단어 가맹점
+sundae = next(t for t in bc_line_txs if "순대국" in t["내역"])
+assert_eq(sundae["내역"], "3대째 소문난 순대국", "bc text 다단어 merchant")
+assert_eq(sundae["금액"], 30000, "bc text 순대국 금액")
 
 print()
 if FAILED:

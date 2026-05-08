@@ -336,6 +336,22 @@ def is_statement_email(subject: str) -> bool:
     return "이용대금명세서" in subject or "이용대금 명세서" in subject
 
 
+# 은행/카드사가 발송하지만 거래 알림이 아닌 메일 (안내/공지/한도/약관 등)
+_NON_TX_SUBJECT_KEYWORDS = (
+    "한도초과", "한도 초과", "안내", "공지", "약관", "변경 안내",
+    "이벤트", "혜택", "당첨", "이용 안내", "이용안내",
+    "비밀번호", "보안", "위험자산", "투자 위험", "고지서",
+    "프로모션", "추첨", "당첨자",
+)
+
+
+def is_non_transaction_subject(subject: str) -> bool:
+    """은행/카드사 발신이지만 거래가 아닌 안내성 메일인지"""
+    if not subject:
+        return False
+    return any(kw in subject for kw in _NON_TX_SUBJECT_KEYWORDS)
+
+
 def get_pdf_attachment(msg) -> tuple:
     """첫 번째 PDF 첨부의 (파일명, 바이트) 반환"""
     for part in msg.walk():
@@ -511,41 +527,89 @@ def parse_statement_table(table: list, statement_year: int, statement_month: int
     return out
 
 
-# 텍스트 한 줄에서 "MM/DD ... 가맹점 ... 12,345" 패턴 추출
-PDF_TEXT_TX_LINE = re.compile(
-    r"^\s*(?P<m>\d{1,2})[\.\-/](?P<d>\d{1,2})\s+(?P<merchant>.+?)\s+(?P<amount>-?[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})\s*$"
-)
+_AMOUNT_TOKEN_RE = re.compile(r"-?[\d]{1,3}(?:,[\d]{3})+(?:\.\d+)?")  # 12,345 / -1,234,567
+_AMOUNT_TOKEN_BARE_RE = re.compile(r"-?[\d]{4,}(?:\.\d+)?")  # 4자리 이상 무콤마 정수
+
+
+def _is_amount_token(tok: str) -> bool:
+    """토큰이 거래 금액으로 보이는지 (콤마 포함, 4자리+ 정수, 또는 0/0원)"""
+    if not tok:
+        return False
+    if tok in ("0", "0원", "(0)"):
+        return True
+    if tok.endswith("원"):
+        tok = tok[:-1]
+    if _AMOUNT_TOKEN_RE.fullmatch(tok):
+        return True
+    if _AMOUNT_TOKEN_BARE_RE.fullmatch(tok):
+        return True
+    if tok.startswith("(") and tok.endswith(")") and _AMOUNT_TOKEN_RE.fullmatch(tok[1:-1]):
+        return True
+    return False
+
+
+_LINE_DATE_RE = re.compile(r"^\s*(\d{1,2})[\.\-/](\d{1,2})\s+(.+)$")
 
 
 def parse_statement_text(text: str, statement_year: int, statement_month: int) -> list:
-    """표 추출 실패 시 텍스트 라인 단위 fallback"""
+    """표 추출 실패 시 텍스트 라인 단위 fallback.
+    BC카드 명세서 한 줄에는 여러 숫자(이용금액/할부개월/회차/원금/수수료/할인/잔액)가 있다.
+    토큰화하여 가맹점(첫 amount 토큰 이전의 텍스트) + 첫 비-0 amount 토큰을 사용한다.
+    할부개월/회차 같은 1~3자리 무콤마 정수는 금액에서 제외한다."""
     if not text:
         return []
     out = []
     for line in text.splitlines():
-        m = PDF_TEXT_TX_LINE.match(line)
+        m = _LINE_DATE_RE.match(line)
         if not m:
             continue
-        month = int(m.group("m"))
-        day = int(m.group("d"))
+        month, day = int(m.group(1)), int(m.group(2))
         if not (1 <= month <= 12 and 1 <= day <= 31):
             continue
-        year = statement_year - 1 if month > statement_month else statement_year
-        date = f"{year}-{month:02d}-{day:02d}"
-        amount = normalize_statement_amount(m.group("amount"))
-        if not amount:
+
+        tokens = m.group(3).split()
+        if not tokens:
             continue
-        merchant = re.sub(r"\s+", " ", m.group("merchant")).strip()[:50]
+
+        merchant_parts = []
+        amounts = []
+        for tok in tokens:
+            if _is_amount_token(tok):
+                amounts.append(tok)
+            elif amounts:
+                # 첫 amount 이후의 비-amount 토큰은 metadata (특별서비스 "면제" 등) → 무시
+                continue
+            else:
+                merchant_parts.append(tok)
+
+        merchant = " ".join(merchant_parts).strip()
         if not merchant:
             continue
+        if any(kw in merchant for kw in _STATEMENT_SKIP_MERCHANT_KEYWORDS):
+            continue
+
+        chosen = None
+        for tok in amounts:
+            v = normalize_statement_amount(tok)
+            if v is None or v == 0:
+                continue
+            chosen = v
+            break
+        if chosen is None:
+            continue
+
+        year = statement_year - 1 if month > statement_month else statement_year
+        date = f"{year}-{month:02d}-{day:02d}"
+        merchant_clean = re.sub(r"\s+", " ", merchant)[:50]
+        tx_type = "입금" if chosen < 0 else "출금"
         out.append({
             "날짜": date,
             "시간": "",
             "출처": "BC카드",
-            "유형": "입금" if amount < 0 else "출금",
-            "금액": abs(amount),
-            "내역": merchant,
-            "카테고리": guess_category(merchant, "출금" if amount > 0 else "입금"),
+            "유형": tx_type,
+            "금액": abs(chosen),
+            "내역": merchant_clean,
+            "카테고리": guess_category(merchant_clean, tx_type),
             "원문": "BC카드 월간명세서",
         })
     return out
@@ -568,25 +632,37 @@ def parse_pdf_transactions(pdf_bytes: bytes, password: str,
         return []
 
     all_txs = []
+    table_total = 0
+    text_total = 0
     try:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages):
             tables = []
             try:
                 tables = page.extract_tables() or []
             except Exception:
                 tables = []
-            page_had_table = False
+            page_table_count = 0
             for table in tables:
                 page_txs = parse_statement_table(table, statement_year, statement_month)
                 if page_txs:
-                    page_had_table = True
+                    page_table_count += len(page_txs)
                     all_txs.extend(page_txs)
-            if not page_had_table:
+            page_text_count = 0
+            if page_table_count == 0:
                 try:
                     text = page.extract_text() or ""
                 except Exception:
                     text = ""
-                all_txs.extend(parse_statement_text(text, statement_year, statement_month))
+                fallback_txs = parse_statement_text(text, statement_year, statement_month)
+                page_text_count = len(fallback_txs)
+                all_txs.extend(fallback_txs)
+            table_total += page_table_count
+            text_total += page_text_count
+            print(
+                f"    page {page_idx + 1}: tables={len(tables)}, "
+                f"table_txs={page_table_count}, fallback_txs={page_text_count}"
+            )
+        print(f"    합계: table {table_total}건 / fallback {text_total}건")
     finally:
         try:
             pdf.close()
@@ -677,6 +753,10 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict) -> tuple:
 
         # BC카드 월간 명세서는 본문에 금액이 없으므로 별도 패스에서 처리
         if source == "BC카드" and is_statement_email(subject):
+            continue
+
+        # 은행/카드사 발신이지만 거래가 아닌 안내성 메일은 사전 차단
+        if source and is_non_transaction_subject(subject):
             continue
 
         if source:
