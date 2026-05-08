@@ -25,10 +25,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install 'gspread>=6.0.0' 'google-auth>=2.28.0'
 
+      - name: 파서 단위 테스트
+        run: python scripts/test_email_parser.py
+
       - name: 이메일 파싱 실행
         env:
           NAVER_EMAIL: ${{ secrets.NAVER_EMAIL }}
           NAVER_APP_PW: ${{ secrets.NAVER_APP_PW }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          ENABLE_EMAIL_CLEANUP: "true"
+          LOOKBACK_HOURS: "2"
         run: python scripts/email_parser.py
