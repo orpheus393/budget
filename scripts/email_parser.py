@@ -101,7 +101,8 @@ EXPENSE_KEYWORDS = ["출금", "이체", "결제", "승인", "사용"]
 CATEGORY_KEYWORDS = {
     "식비": ["식당", "음식", "카페", "커피", "배달", "맥도날드", "스타벅스", "버거킹",
              "편의점", "GS25", "CU", "세븐", "이마트24", "투썸", "메가", "공차",
-             "BBQ", "교촌", "도미노", "피자"],
+             "BBQ", "교촌", "도미노", "피자", "짬뽕", "국수", "순대", "칼국수",
+             "수산", "분식", "치킨", "족발"],
     "교통": ["택시", "버스", "지하철", "주유", "카카오택시", "티머니", "하이패스",
              "S-OIL", "SK에너지", "GS칼텍스", "현대오일뱅크", "철도", "코레일"],
     "쇼핑": ["쿠팡", "네이버", "G마켓", "옥션", "11번가", "이마트", "홈플러스",
@@ -111,6 +112,8 @@ CATEGORY_KEYWORDS = {
     "구독": ["넷플릭스", "유튜브", "스포티파이", "왓챠", "애플", "MS", "어도비",
              "디즈니", "티빙", "웨이브"],
     "주거": ["관리비", "전기", "수도", "가스", "월세", "임대료", "한국전력", "도시가스"],
+    "문화": ["CGV", "메가박스", "롯데시네마", "영화", "공연", "박물관", "전시"],
+    "미용": ["헤어", "미용실", "이발", "네일", "피부관리", "뷰티"],
     "수입": ["급여", "이자", "환급", "월급", "보너스"],
 }
 
@@ -401,39 +404,108 @@ def normalize_statement_amount(raw: str):
         return None
 
 
-def parse_statement_table(table: list, statement_year: int, statement_month: int) -> list:
-    """pdfplumber.extract_tables()의 한 표를 거래 리스트로 변환"""
-    if not table or len(table) < 2:
-        return []
-    header = [_norm_header_cell(c) for c in (table[0] or [])]
-    date_idx = _find_col_idx(header, ["이용일", "사용일", "거래일", "승인일", "매출일"])
-    merchant_idx = _find_col_idx(header, ["가맹점", "이용처", "사용처", "이용내역", "내용"])
-    amount_idx = _find_col_idx(header, ["이용금액", "결제금액", "청구금액", "승인금액", "금액"])
-    if date_idx is None or amount_idx is None:
-        return []
-    out = []
-    for row in table[1:]:
+_DATE_CELL_RE = re.compile(r"^\s*\d{1,2}[/.\-]\d{1,2}\s*$")
+
+# 명세서에서 거래가 아닌 행을 식별하는 키워드 (가맹점명에 등장하면 skip)
+_STATEMENT_SKIP_MERCHANT_KEYWORDS = ("소계", "합계", "(본인)", "(신용)", "(체크)")
+
+
+def _detect_header_and_data_start(table: list):
+    """다중 행 헤더 + 데이터 시작 위치 감지.
+    헤더는 컬럼별로 세로 join하여 키워드 매칭에 사용한다.
+    반환: (flat_header, data_start_idx) 또는 (None, None) — 데이터 행 없음."""
+    if not table:
+        return None, None
+    data_start = None
+    for i, row in enumerate(table):
         if not row:
             continue
-        try:
-            date_raw = row[date_idx]
-            amount_raw = row[amount_idx]
-            merchant = (row[merchant_idx] if merchant_idx is not None and merchant_idx < len(row) else "") or ""
-        except IndexError:
+        first = row[0] if len(row) > 0 else ""
+        if _DATE_CELL_RE.match(str(first or "").strip()):
+            data_start = i
+            break
+    if data_start is None or data_start == 0:
+        return None, None
+
+    header_rows = table[:data_start]
+    max_cols = max((len(r or []) for r in header_rows), default=0)
+    flat = []
+    for col in range(max_cols):
+        parts = []
+        for r in header_rows:
+            cell = r[col] if r and col < len(r) else None
+            if cell is None:
+                continue
+            cell_str = str(cell).strip()
+            if cell_str:
+                parts.append(cell_str)
+        flat.append(_norm_header_cell(" ".join(parts)))
+    return flat, data_start
+
+
+def parse_statement_table(table: list, statement_year: int, statement_month: int) -> list:
+    """pdfplumber.extract_tables()의 한 표를 거래 리스트로 변환.
+    BC카드 명세서는 다중 행 헤더 + 그룹/소계 행이 섞여 있으므로 이를 모두 처리한다."""
+    if not table or len(table) < 2:
+        return []
+
+    flat_header, data_start = _detect_header_and_data_start(table)
+    if not flat_header or data_start is None:
+        return []
+
+    date_idx = _find_col_idx(flat_header, ["이용일자", "이용일", "사용일", "거래일", "승인일", "매출일"])
+    merchant_idx = _find_col_idx(flat_header, [
+        "가맹점(은행)명", "가맹점명", "가맹점", "이용처", "사용처", "이용내역", "내용"
+    ])
+    # 청구 기준 우선순위: 원금(KRW) > 청구금액/결제금액 > 이용금액
+    amount_primary = _find_col_idx(flat_header, ["원금(KRW)", "원금"])
+    amount_secondary = _find_col_idx(flat_header, ["청구금액", "결제금액", "승인금액"])
+    amount_fallback = _find_col_idx(flat_header, ["이용금액", "이용 금액", "금액"])
+    amount_candidates = [i for i in (amount_primary, amount_secondary, amount_fallback) if i is not None]
+    if date_idx is None or not amount_candidates:
+        return []
+
+    out = []
+    for row in table[data_start:]:
+        if not row:
             continue
-        date = normalize_statement_date(date_raw or "", statement_year, statement_month)
-        amount = normalize_statement_amount(amount_raw or "")
-        if not date or not amount:
+        merchant_raw = ""
+        if merchant_idx is not None and merchant_idx < len(row):
+            merchant_raw = str(row[merchant_idx] or "").strip()
+        if not merchant_raw:
             continue
-        merchant_clean = re.sub(r"\s+", " ", str(merchant)).strip()[:50] or "알 수 없음"
+        if any(kw in merchant_raw for kw in _STATEMENT_SKIP_MERCHANT_KEYWORDS):
+            continue
+
+        date_raw = str(row[date_idx] or "").strip() if date_idx < len(row) else ""
+        date = normalize_statement_date(date_raw, statement_year, statement_month)
+        if not date:
+            continue
+
+        # 우선순위에 따라 첫 비어있지 않은 금액 셀 사용
+        amount = None
+        for idx in amount_candidates:
+            if idx >= len(row):
+                continue
+            cell = row[idx]
+            if cell is None or not str(cell).strip():
+                continue
+            amount = normalize_statement_amount(cell)
+            if amount is not None:
+                break
+        if amount is None or amount == 0:
+            continue
+
+        merchant_clean = re.sub(r"\s+", " ", merchant_raw)[:50]
+        tx_type = "입금" if amount < 0 else "출금"
         out.append({
             "날짜": date,
             "시간": "",
             "출처": "BC카드",
-            "유형": "입금" if amount < 0 else "출금",
+            "유형": tx_type,
             "금액": abs(amount),
             "내역": merchant_clean,
-            "카테고리": guess_category(merchant_clean, "출금" if amount > 0 else "입금"),
+            "카테고리": guess_category(merchant_clean, tx_type),
             "원문": "BC카드 월간명세서",
         })
     return out
