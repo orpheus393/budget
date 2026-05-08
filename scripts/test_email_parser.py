@@ -17,6 +17,11 @@ from email_parser import (
     classify_non_transaction,
     strip_html,
     imap_utf7_encode,
+    is_statement_email,
+    normalize_statement_date,
+    normalize_statement_amount,
+    parse_statement_table,
+    parse_statement_text,
     AD_FOLDER,
     SHOPPING_FOLDER,
     NEWSLETTER_FOLDER,
@@ -147,6 +152,59 @@ try:
     assert_eq(decoded, "가계부_처리완료", "utf7 roundtrip")
 except (LookupError, UnicodeDecodeError):
     print("   imap4-utf-7 codec not available — skipping roundtrip")
+
+# ── BC카드 명세서 ──
+assert_eq(is_statement_email("임영재님의 IBK기업은행 BC카드 2026년 04월 19일 이용대금명세서입니다."),
+          True, "is_statement_email true")
+assert_eq(is_statement_email("BC카드 12,500원 결제"), False, "is_statement_email false")
+
+# 날짜 정규화: 명세서 발행이 2026-04, 거래월이 03이면 같은 해
+assert_eq(normalize_statement_date("03/15", 2026, 4), "2026-03-15", "stmt date 03/15")
+assert_eq(normalize_statement_date("4.10", 2026, 4), "2026-04-10", "stmt date 4.10")
+# 1월 명세에서 12월 거래는 전년도
+assert_eq(normalize_statement_date("12-28", 2026, 1), "2025-12-28", "stmt date prev year")
+# 풀 날짜
+assert_eq(normalize_statement_date("2026.04.05", 2026, 4), "2026-04-05", "stmt date full")
+assert_eq(normalize_statement_date("aaa", 2026, 4), None, "stmt date invalid")
+
+# 금액 정규화
+assert_eq(normalize_statement_amount("12,500원"), 12500, "stmt amount 콤마+원")
+assert_eq(normalize_statement_amount("-3,000"), -3000, "stmt amount 음수")
+assert_eq(normalize_statement_amount("(1,500)"), -1500, "stmt amount 괄호")
+assert_eq(normalize_statement_amount(""), None, "stmt amount empty")
+
+# 표 파싱
+sample_table = [
+    ["이용일", "가맹점명", "이용금액"],
+    ["03/12", "스타벅스 강남점", "5,800"],
+    ["03/15", "쿠팡", "23,400원"],
+    ["", "", ""],  # 빈 행
+    ["03/20", "메가커피", "(1,200)"],  # 부분취소 (음수)
+]
+txs = parse_statement_table(sample_table, 2026, 4)
+assert_eq(len(txs), 3, "stmt table row count")
+assert_eq(txs[0]["날짜"], "2026-03-12", "stmt table row0 date")
+assert_eq(txs[0]["금액"], 5800, "stmt table row0 amount")
+assert_eq(txs[0]["내역"], "스타벅스 강남점", "stmt table row0 merchant")
+assert_eq(txs[0]["출처"], "BC카드", "stmt table source")
+assert_eq(txs[0]["카테고리"], "식비", "stmt table category")
+assert_eq(txs[1]["카테고리"], "쇼핑", "stmt table 쇼핑")
+assert_eq(txs[2]["유형"], "입금", "stmt table 음수=입금")
+assert_eq(txs[2]["금액"], 1200, "stmt table 음수 금액 절대값")
+
+# 텍스트 라인 fallback
+sample_text = """
+이용일자  가맹점명           이용금액
+03/14 메가커피 4,500
+03-16 GS25 강남점 12,300
+빈줄
+04.02 스타벅스코리아 6,500
+"""
+txs2 = parse_statement_text(sample_text, 2026, 4)
+assert_eq(len(txs2), 3, "stmt text row count")
+assert_eq(txs2[0]["날짜"], "2026-03-14", "stmt text row0 date")
+assert_eq(txs2[1]["금액"], 12300, "stmt text row1 amount")
+assert_eq(txs2[2]["내역"], "스타벅스코리아", "stmt text row2 merchant")
 
 print()
 if FAILED:

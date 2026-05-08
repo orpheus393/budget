@@ -21,6 +21,11 @@ GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
 ENABLE_EMAIL_CLEANUP = os.environ.get("ENABLE_EMAIL_CLEANUP", "").lower() in ("1", "true", "yes")
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "2"))
+# BC카드 명세서 PDF 비밀번호 (생년월일 6자리). 미설정 시 PDF 파싱 건너뜀.
+BC_PDF_PASSWORD = os.environ.get("BC_PDF_PASSWORD", "")
+# 명세서를 한 번 파싱한 후에도 다음 달까지 LOOKBACK_HOURS 윈도우 밖에 머물 수 있으므로
+# 명세서 메일 검색은 별도로 더 긴 윈도우(기본 35일)를 사용한다.
+STATEMENT_LOOKBACK_DAYS = int(os.environ.get("STATEMENT_LOOKBACK_DAYS", "35"))
 
 IMAP_HOST = "imap.naver.com"
 IMAP_PORT = 993
@@ -31,6 +36,7 @@ AD_FOLDER = "가계부_광고"
 SHOPPING_FOLDER = "가계부_쇼핑"
 NEWSLETTER_FOLDER = "가계부_뉴스레터"
 SNS_FOLDER = "가계부_SNS"
+STATEMENT_FOLDER = "가계부_명세서"  # PDF 파싱 실패 시 보관용
 
 # ── 발신자 → 출처 매핑 (결제/은행 알림만) ─────────────
 SENDER_PATTERNS = {
@@ -322,6 +328,211 @@ def classify_non_transaction(sender: str, subject: str) -> str | None:
     return None
 
 
+# ── BC카드 월간 명세서 PDF 파싱 ────────────────────────
+def is_statement_email(subject: str) -> bool:
+    return "이용대금명세서" in subject or "이용대금 명세서" in subject
+
+
+def get_pdf_attachment(msg) -> tuple:
+    """첫 번째 PDF 첨부의 (파일명, 바이트) 반환"""
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        filename_raw = part.get_filename()
+        filename = decode_str(filename_raw) if filename_raw else ""
+        ctype = part.get_content_type()
+        if ctype == "application/pdf" or filename.lower().endswith(".pdf"):
+            try:
+                payload = part.get_payload(decode=True)
+            except Exception:
+                payload = None
+            if payload:
+                return filename, payload
+    return None, None
+
+
+def _norm_header_cell(s) -> str:
+    return re.sub(r"\s+", "", str(s or ""))
+
+
+def _find_col_idx(header: list, candidates: list):
+    for i, h in enumerate(header):
+        for c in candidates:
+            if c in h:
+                return i
+    return None
+
+
+def normalize_statement_date(raw: str, statement_year: int, statement_month: int):
+    """다양한 날짜 포맷 → YYYY-MM-DD. 명세서 발행 월보다 큰 월은 전년도로 가정."""
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    m = re.match(r"(\d{4})[\.\-/]\s*(\d{1,2})[\.\-/]\s*(\d{1,2})", raw)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.match(r"(\d{1,2})[\.\-/]\s*(\d{1,2})", raw)
+    if m:
+        month = int(m.group(1))
+        day = int(m.group(2))
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            return None
+        year = statement_year - 1 if month > statement_month else statement_year
+        return f"{year}-{month:02d}-{day:02d}"
+    return None
+
+
+def normalize_statement_amount(raw: str):
+    if raw is None:
+        return None
+    s = str(raw).replace(",", "").replace("원", "").replace(" ", "")
+    if not s:
+        return None
+    sign = 1
+    if s.startswith("-"):
+        sign = -1
+        s = s[1:]
+    elif s.startswith("(") and s.endswith(")"):
+        sign = -1
+        s = s[1:-1]
+    try:
+        return int(s) * sign
+    except ValueError:
+        return None
+
+
+def parse_statement_table(table: list, statement_year: int, statement_month: int) -> list:
+    """pdfplumber.extract_tables()의 한 표를 거래 리스트로 변환"""
+    if not table or len(table) < 2:
+        return []
+    header = [_norm_header_cell(c) for c in (table[0] or [])]
+    date_idx = _find_col_idx(header, ["이용일", "사용일", "거래일", "승인일", "매출일"])
+    merchant_idx = _find_col_idx(header, ["가맹점", "이용처", "사용처", "이용내역", "내용"])
+    amount_idx = _find_col_idx(header, ["이용금액", "결제금액", "청구금액", "승인금액", "금액"])
+    if date_idx is None or amount_idx is None:
+        return []
+    out = []
+    for row in table[1:]:
+        if not row:
+            continue
+        try:
+            date_raw = row[date_idx]
+            amount_raw = row[amount_idx]
+            merchant = (row[merchant_idx] if merchant_idx is not None and merchant_idx < len(row) else "") or ""
+        except IndexError:
+            continue
+        date = normalize_statement_date(date_raw or "", statement_year, statement_month)
+        amount = normalize_statement_amount(amount_raw or "")
+        if not date or not amount:
+            continue
+        merchant_clean = re.sub(r"\s+", " ", str(merchant)).strip()[:50] or "알 수 없음"
+        out.append({
+            "날짜": date,
+            "시간": "",
+            "출처": "BC카드",
+            "유형": "입금" if amount < 0 else "출금",
+            "금액": abs(amount),
+            "내역": merchant_clean,
+            "카테고리": guess_category(merchant_clean, "출금" if amount > 0 else "입금"),
+            "원문": "BC카드 월간명세서",
+        })
+    return out
+
+
+# 텍스트 한 줄에서 "MM/DD ... 가맹점 ... 12,345" 패턴 추출
+PDF_TEXT_TX_LINE = re.compile(
+    r"^\s*(?P<m>\d{1,2})[\.\-/](?P<d>\d{1,2})\s+(?P<merchant>.+?)\s+(?P<amount>-?[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})\s*$"
+)
+
+
+def parse_statement_text(text: str, statement_year: int, statement_month: int) -> list:
+    """표 추출 실패 시 텍스트 라인 단위 fallback"""
+    if not text:
+        return []
+    out = []
+    for line in text.splitlines():
+        m = PDF_TEXT_TX_LINE.match(line)
+        if not m:
+            continue
+        month = int(m.group("m"))
+        day = int(m.group("d"))
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            continue
+        year = statement_year - 1 if month > statement_month else statement_year
+        date = f"{year}-{month:02d}-{day:02d}"
+        amount = normalize_statement_amount(m.group("amount"))
+        if not amount:
+            continue
+        merchant = re.sub(r"\s+", " ", m.group("merchant")).strip()[:50]
+        if not merchant:
+            continue
+        out.append({
+            "날짜": date,
+            "시간": "",
+            "출처": "BC카드",
+            "유형": "입금" if amount < 0 else "출금",
+            "금액": abs(amount),
+            "내역": merchant,
+            "카테고리": guess_category(merchant, "출금" if amount > 0 else "입금"),
+            "원문": "BC카드 월간명세서",
+        })
+    return out
+
+
+def parse_pdf_transactions(pdf_bytes: bytes, password: str,
+                           statement_year: int, statement_month: int) -> list:
+    """비밀번호 PDF에서 거래 추출 (표 우선, 텍스트 fallback)"""
+    import io
+    try:
+        import pdfplumber
+    except ImportError:
+        print("⚠️  pdfplumber 미설치: PDF 파싱 건너뜀")
+        return []
+
+    try:
+        pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+    except Exception as exc:
+        print(f"PDF 열기 실패 (비밀번호 또는 포맷): {exc}")
+        return []
+
+    all_txs = []
+    try:
+        for page in pdf.pages:
+            tables = []
+            try:
+                tables = page.extract_tables() or []
+            except Exception:
+                tables = []
+            page_had_table = False
+            for table in tables:
+                page_txs = parse_statement_table(table, statement_year, statement_month)
+                if page_txs:
+                    page_had_table = True
+                    all_txs.extend(page_txs)
+            if not page_had_table:
+                try:
+                    text = page.extract_text() or ""
+                except Exception:
+                    text = ""
+                all_txs.extend(parse_statement_text(text, statement_year, statement_month))
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+
+    # 같은 (날짜, 내역, 금액) 중복 제거
+    seen = set()
+    deduped = []
+    for tx in all_txs:
+        key = (tx["날짜"], tx["내역"], tx["금액"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(tx)
+    return deduped
+
+
 # ── IMAP 작업 ─────────────────────────────────────────
 def connect_imap():
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
@@ -391,6 +602,10 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict) -> tuple:
             if any(p.lower() in sender.lower() for p in patterns):
                 source = name
                 break
+
+        # BC카드 월간 명세서는 본문에 금액이 없으므로 별도 패스에서 처리
+        if source == "BC카드" and is_statement_email(subject):
+            continue
 
         if source:
             try:
@@ -472,6 +687,71 @@ def prepare_dest_folders(mail) -> dict:
     return mapping
 
 
+def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
+    """BC카드 월간 명세서 PDF 처리. (transactions, moved_count) 반환."""
+    transactions = []
+    moved_count = 0
+    if not BC_PDF_PASSWORD:
+        return transactions, moved_count
+
+    since = (datetime.now() - timedelta(days=STATEMENT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+
+    for folder in folders:
+        try:
+            status, _ = mail.select(f'"{folder}"', readonly=False)
+            if status != "OK":
+                continue
+            _, data = mail.search(None, f'(SINCE "{since}" FROM "bccard.com")')
+            eids = data[0].split() if data and data[0] else []
+        except Exception as exc:
+            print(f"명세서 검색 실패 ({folder}): {exc}")
+            continue
+
+        for eid in eids:
+            try:
+                _, msg_data = mail.fetch(eid, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_str(msg.get("Subject", ""))
+                date_str = msg.get("Date", "")
+            except Exception as exc:
+                print(f"명세서 FETCH 실패 (eid={eid}): {exc}")
+                continue
+
+            if not is_statement_email(subject):
+                continue
+
+            try:
+                dt = parsedate_to_datetime(date_str)
+                s_year, s_month = dt.year, dt.month
+            except Exception:
+                now = datetime.now()
+                s_year, s_month = now.year, now.month
+
+            fname, pdf_bytes = get_pdf_attachment(msg)
+            if not pdf_bytes:
+                print(f"  · 명세서 첨부 없음: {subject[:60]}")
+                continue
+
+            print(f"  · 명세서 PDF 파싱 중: {fname or '(이름 없음)'} (size={len(pdf_bytes)}B)")
+            pdf_txs = parse_pdf_transactions(pdf_bytes, BC_PDF_PASSWORD, s_year, s_month)
+            if pdf_txs:
+                transactions.extend(pdf_txs)
+                print(f"    → {len(pdf_txs)}건 추출 ({s_year}-{s_month:02d} 명세)")
+                if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
+                    if move_email(mail, eid, dest_folders["처리완료"]):
+                        moved_count += 1
+            else:
+                print(f"    → 추출 0건. PDF 포맷/비번 확인 필요")
+
+        if ENABLE_EMAIL_CLEANUP:
+            try:
+                mail.expunge()
+            except Exception as exc:
+                print(f"명세서 EXPUNGE 실패 ({folder}): {exc}")
+
+    return transactions, moved_count
+
+
 # ── Google Sheets 저장 ────────────────────────────────
 def save_to_sheets(transactions: list):
     import json
@@ -549,6 +829,17 @@ def main():
                 total_moved[k] = total_moved.get(k, 0) + v
         except Exception as exc:
             print(f"폴더 처리 실패 ({folder}): {exc}")
+
+    # BC카드 월간 명세서 PDF 별도 패스 (LOOKBACK_DAYS 윈도우)
+    if BC_PDF_PASSWORD:
+        try:
+            stmt_txs, stmt_moved = process_statements(mail, IMAP_FOLDERS, dest_folders)
+            all_transactions.extend(stmt_txs)
+            total_moved["명세서"] = stmt_moved
+        except Exception as exc:
+            print(f"명세서 처리 실패: {exc}")
+    else:
+        print("ℹ️  BC_PDF_PASSWORD 미설정: 월간 명세서 PDF 파싱 건너뜀")
 
     print(f"파싱된 거래: {len(all_transactions)}개")
     if ENABLE_EMAIL_CLEANUP:
