@@ -615,25 +615,53 @@ def parse_statement_text(text: str, statement_year: int, statement_month: int) -
     return out
 
 
-def parse_pdf_transactions(pdf_bytes: bytes, password: str,
-                           statement_year: int, statement_month: int) -> list:
-    """비밀번호 PDF에서 거래 추출 (표 우선, 텍스트 fallback)"""
+def _extract_pdf_text_pymupdf(pdf_bytes: bytes, password: str):
+    """PyMuPDF로 페이지별 텍스트 추출. 한국어 PDF의 ToUnicode 매핑 문제에 견고.
+    반환: list[str] (페이지별), 또는 실패 시 None"""
+    try:
+        import fitz  # pymupdf
+    except ImportError:
+        return None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        print(f"    [pymupdf] 열기 실패: {exc}")
+        return None
+    try:
+        if doc.is_encrypted:
+            ok = doc.authenticate(password)
+            if not ok:
+                print("    [pymupdf] 비밀번호 인증 실패")
+                return None
+        pages = []
+        for page in doc:
+            try:
+                pages.append(page.get_text() or "")
+            except Exception:
+                pages.append("")
+        return pages
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
+def _extract_pdf_with_pdfplumber(pdf_bytes: bytes, password: str,
+                                  statement_year: int, statement_month: int) -> list:
+    """pdfplumber 기반 추출 (표 우선, 텍스트 fallback). PyMuPDF 실패 시 사용."""
     import io
     try:
         import pdfplumber
     except ImportError:
-        print("⚠️  pdfplumber 미설치: PDF 파싱 건너뜀")
+        print("    [pdfplumber] 미설치")
         return []
-
     try:
         pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
     except Exception as exc:
-        print(f"PDF 열기 실패 (비밀번호 또는 포맷): {exc}")
+        print(f"    [pdfplumber] 열기 실패: {exc}")
         return []
-
     all_txs = []
-    table_total = 0
-    text_total = 0
     try:
         for page_idx, page in enumerate(pdf.pages):
             tables = []
@@ -656,29 +684,53 @@ def parse_pdf_transactions(pdf_bytes: bytes, password: str,
                 fallback_txs = parse_statement_text(text, statement_year, statement_month)
                 page_text_count = len(fallback_txs)
                 all_txs.extend(fallback_txs)
-            table_total += page_table_count
-            text_total += page_text_count
             print(
-                f"    page {page_idx + 1}: tables={len(tables)}, "
+                f"    [pdfplumber] page {page_idx + 1}: tables={len(tables)}, "
                 f"table_txs={page_table_count}, fallback_txs={page_text_count}"
             )
-        print(f"    합계: table {table_total}건 / fallback {text_total}건")
     finally:
         try:
             pdf.close()
         except Exception:
             pass
+    return all_txs
 
-    # 같은 (날짜, 내역, 금액) 중복 제거
+
+def parse_pdf_transactions(pdf_bytes: bytes, password: str,
+                           statement_year: int, statement_month: int) -> list:
+    """비밀번호 PDF에서 거래 추출.
+    한글 PDF는 pdfplumber에서 ToUnicode 매핑 깨짐이 흔하므로 PyMuPDF를 우선 사용.
+    PyMuPDF 실패 시 pdfplumber로 fallback."""
+    all_txs = []
+
+    # 1순위: PyMuPDF로 페이지 텍스트 추출 후 라인 단위 파싱
+    pages = _extract_pdf_text_pymupdf(pdf_bytes, password)
+    if pages is not None:
+        for i, text in enumerate(pages):
+            page_txs = parse_statement_text(text, statement_year, statement_month)
+            print(f"    [pymupdf] page {i + 1}: txs={len(page_txs)}")
+            all_txs.extend(page_txs)
+        if all_txs:
+            return _dedup_pdf_transactions(all_txs)
+        # PyMuPDF는 텍스트는 뽑았지만 매칭 0건이면 pdfplumber도 시도
+        print("    [pymupdf] 매칭 0건, pdfplumber 재시도")
+
+    # 2순위: pdfplumber (표 추출 + 텍스트 fallback)
+    plumber_txs = _extract_pdf_with_pdfplumber(pdf_bytes, password, statement_year, statement_month)
+    all_txs.extend(plumber_txs)
+    return _dedup_pdf_transactions(all_txs)
+
+
+def _dedup_pdf_transactions(txs: list) -> list:
     seen = set()
-    deduped = []
-    for tx in all_txs:
+    out = []
+    for tx in txs:
         key = (tx["날짜"], tx["내역"], tx["금액"])
         if key in seen:
             continue
         seen.add(key)
-        deduped.append(tx)
-    return deduped
+        out.append(tx)
+    return out
 
 
 # ── IMAP 작업 ─────────────────────────────────────────
@@ -767,6 +819,9 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict) -> tuple:
                 amount = parse_amount(full_text)
                 if amount is None:
                     print(f"  · 금액 파싱 실패: [{source}] {subject[:50]}")
+                    continue
+                if amount == 0:
+                    # 0원 거래는 의미 없음 (면제/안내성)
                     continue
 
                 tx_type = parse_transaction_type(full_text, source)
