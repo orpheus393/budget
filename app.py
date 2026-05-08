@@ -8,10 +8,40 @@ import gspread
 from google.oauth2.service_account import Credentials
 import json
 import os
+import re
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date
 import calendar
+
+
+# ── 카테고리 자동 분류 ────────────────────────────────
+CATEGORY_KEYWORDS = {
+    "식비": ["식당", "음식", "카페", "커피", "배달", "맥도날드", "스타벅스", "버거킹",
+             "편의점", "GS25", "CU", "세븐", "이마트24", "투썸", "메가", "공차",
+             "BBQ", "교촌", "도미노", "피자"],
+    "교통": ["택시", "버스", "지하철", "주유", "카카오택시", "티머니", "하이패스",
+             "S-OIL", "SK에너지", "GS칼텍스", "현대오일뱅크", "철도", "코레일"],
+    "쇼핑": ["쿠팡", "네이버", "G마켓", "옥션", "11번가", "이마트", "홈플러스",
+             "코스트코", "마켓컬리", "올리브영", "다이소", "무신사"],
+    "의료": ["병원", "약국", "의원", "클리닉", "치과", "한의원"],
+    "통신": ["SKT", "KT", "LG", "통신", "인터넷", "헬로비전"],
+    "구독": ["넷플릭스", "유튜브", "스포티파이", "왓챠", "애플", "MS", "어도비",
+             "디즈니", "티빙", "웨이브"],
+    "주거": ["관리비", "전기", "수도", "가스", "월세", "임대료", "한국전력", "도시가스"],
+    "수입": ["급여", "이자", "환급", "월급", "보너스"],
+}
+
+
+def guess_category(merchant: str, tx_type: str) -> str:
+    if tx_type == "입금":
+        return "수입"
+    text = (merchant or "").lower()
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw.lower() in text:
+                return category
+    return "기타"
 
 # ── 페이지 설정 ──────────────────────────────────────
 st.set_page_config(
@@ -48,22 +78,32 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ── Google Sheets 클라이언트 ──────────────────────────
+SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def get_worksheet():
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    sheet_id = st.secrets["GOOGLE_SHEET_ID"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    sheet = gc.open_by_key(sheet_id)
+    try:
+        ws = sheet.worksheet("거래내역")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet("거래내역", rows=10000, cols=10)
+        ws.append_row(["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문"])
+    return ws
+
+
 # ── Google Sheets 로드 ────────────────────────────────
 @st.cache_data(ttl=300)  # 5분 캐시
 def load_data():
     try:
-        # Streamlit secrets에서 인증 정보 가져오기
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        sheet_id = st.secrets["GOOGLE_SHEET_ID"]
-
-        scopes = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sheet = gc.open_by_key(sheet_id)
-        ws = sheet.worksheet("거래내역")
+        ws = get_worksheet()
         data = ws.get_all_records()
         df = pd.DataFrame(data)
 
@@ -79,6 +119,136 @@ def load_data():
     except Exception as e:
         st.error(f"데이터 로드 오류: {e}")
         return pd.DataFrame(columns=["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문"])
+
+
+# ── 현대카드 Excel/CSV 파서 ───────────────────────────
+HYUNDAI_COL_ALIASES = {
+    "날짜": ["이용일", "이용일자", "거래일", "거래일자", "사용일", "승인일자", "승인일"],
+    "시간": ["이용시간", "거래시간", "승인시간", "사용시간"],
+    "내역": ["가맹점명", "이용가맹점", "가맹점", "이용처", "사용처"],
+    "금액": ["이용금액", "승인금액", "결제금액", "청구금액", "금액", "이용금액(원)"],
+    "구분": ["이용구분", "거래구분", "구분", "할부", "할부개월"],
+}
+
+
+def _find_header_row(df_raw: pd.DataFrame, max_scan: int = 15) -> int:
+    """현대카드 엑셀은 상단에 메타 행이 있을 수 있어, 헤더 행을 휴리스틱으로 탐색"""
+    targets = set(sum(HYUNDAI_COL_ALIASES.values(), []))
+    for idx in range(min(max_scan, len(df_raw))):
+        row_vals = [str(v).strip() for v in df_raw.iloc[idx].tolist()]
+        if sum(1 for v in row_vals if v in targets) >= 2:
+            return idx
+    return 0
+
+
+def _match_column(columns, aliases):
+    cols = [str(c).strip() for c in columns]
+    for alias in aliases:
+        for i, c in enumerate(cols):
+            if c == alias:
+                return columns[i]
+    # 부분 일치 fallback
+    for alias in aliases:
+        for i, c in enumerate(cols):
+            if alias in c:
+                return columns[i]
+    return None
+
+
+def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
+    """현대카드 Excel/CSV → 표준 거래 DataFrame"""
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        try:
+            raw = pd.read_csv(uploaded_file, encoding="cp949", header=None)
+        except UnicodeDecodeError:
+            uploaded_file.seek(0)
+            raw = pd.read_csv(uploaded_file, encoding="utf-8", header=None)
+    else:
+        raw = pd.read_excel(uploaded_file, header=None)
+
+    header_idx = _find_header_row(raw)
+    df = raw.iloc[header_idx + 1:].copy()
+    df.columns = raw.iloc[header_idx].tolist()
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    col_date = _match_column(df.columns, HYUNDAI_COL_ALIASES["날짜"])
+    col_amount = _match_column(df.columns, HYUNDAI_COL_ALIASES["금액"])
+    col_merchant = _match_column(df.columns, HYUNDAI_COL_ALIASES["내역"])
+    col_time = _match_column(df.columns, HYUNDAI_COL_ALIASES["시간"])
+    col_type = _match_column(df.columns, HYUNDAI_COL_ALIASES["구분"])
+
+    if not col_date or not col_amount:
+        raise ValueError(
+            f"필수 컬럼을 찾을 수 없어요. 감지된 컬럼: {list(df.columns)}"
+        )
+
+    out = pd.DataFrame()
+    out["날짜"] = pd.to_datetime(df[col_date], errors="coerce").dt.strftime("%Y-%m-%d")
+    out["시간"] = (
+        df[col_time].astype(str).str.strip() if col_time else ""
+    )
+    out["출처"] = "현대카드"
+
+    def _to_amount(v):
+        if pd.isna(v):
+            return 0
+        s = re.sub(r"[^\d\-]", "", str(v))
+        try:
+            return abs(int(s)) if s else 0
+        except ValueError:
+            return 0
+
+    out["금액"] = df[col_amount].apply(_to_amount)
+
+    def _to_type(v):
+        s = str(v) if v is not None else ""
+        if any(k in s for k in ["취소", "환불", "입금"]):
+            return "입금"
+        return "출금"
+
+    if col_type:
+        out["유형"] = df[col_type].apply(_to_type)
+    else:
+        out["유형"] = "출금"
+
+    out["내역"] = (
+        df[col_merchant].astype(str).str.strip() if col_merchant else "현대카드 사용"
+    )
+    out["카테고리"] = [
+        guess_category(m, t) for m, t in zip(out["내역"], out["유형"])
+    ]
+    out["원문"] = "현대카드 업로드"
+
+    out = out.dropna(subset=["날짜"])
+    out = out[out["금액"] > 0].reset_index(drop=True)
+    return out
+
+
+def append_transactions_to_sheet(transactions: list[dict]) -> int:
+    """중복 제외하고 시트에 추가, 추가 건수 반환"""
+    ws = get_worksheet()
+    existing = ws.get_all_values()
+    existing_keys = set()
+    for row in existing[1:]:
+        if len(row) >= 6:
+            # 날짜_출처_금액_내역
+            existing_keys.add(f"{row[0]}_{row[2]}_{row[4]}_{row[5]}")
+
+    new_rows = []
+    for tx in transactions:
+        key = f"{tx['날짜']}_{tx['출처']}_{tx['금액']}_{tx['내역']}"
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        new_rows.append([
+            tx["날짜"], tx.get("시간", ""), tx["출처"], tx["유형"],
+            tx["금액"], tx["내역"], tx["카테고리"], tx.get("원문", ""),
+        ])
+
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="USER_ENTERED")
+    return len(new_rows)
 
 
 # ── 사이드바 ──────────────────────────────────────────
@@ -239,25 +409,46 @@ else:
 # ── 현대카드 수동 업로드 ──────────────────────────────
 st.markdown("---")
 st.subheader("💳 현대카드 내역 업로드")
+
 col_up, col_info = st.columns([1, 2])
 with col_up:
     uploaded = st.file_uploader("현대카드 Excel/CSV 파일", type=["xlsx", "csv"])
-    if uploaded:
-        try:
-            if uploaded.name.endswith(".csv"):
-                card_df = pd.read_csv(uploaded, encoding="cp949")
-            else:
-                card_df = pd.read_excel(uploaded)
-            st.success(f"✅ {len(card_df)}건 로드됨")
-            st.dataframe(card_df.head(), use_container_width=True)
-            st.info("현대카드 파일 컬럼 구조를 확인 후 파싱 로직을 추가할게요.")
-        except Exception as e:
-            st.error(f"파일 오류: {e}")
 with col_info:
     st.markdown("""
     **현대카드 내역 내보내기 방법:**
     1. 현대카드 앱 → 이용내역
     2. 우측 상단 다운로드 아이콘
     3. Excel 파일 저장
-    4. 여기에 업로드
+    4. 여기에 업로드 → 미리보기 확인 → **시트에 저장**
     """)
+
+if uploaded:
+    try:
+        parsed = parse_hyundai_file(uploaded)
+    except Exception as e:
+        st.error(f"파일 파싱 오류: {e}")
+        parsed = None
+
+    if parsed is not None:
+        if parsed.empty:
+            st.warning("거래 내역을 찾지 못했어요. 파일 형식을 확인해주세요.")
+        else:
+            st.success(f"✅ {len(parsed)}건 파싱됨 — 합계 {parsed['금액'].sum():,.0f}원")
+            edited = st.data_editor(
+                parsed,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="hyundai_editor",
+            )
+            if st.button("📤 Google Sheets에 저장", type="primary"):
+                try:
+                    transactions = edited.to_dict(orient="records")
+                    added = append_transactions_to_sheet(transactions)
+                    if added:
+                        st.success(f"✅ {added}건 시트에 저장 완료 (중복 {len(transactions) - added}건 제외)")
+                        st.cache_data.clear()
+                    else:
+                        st.info(f"중복 {len(transactions)}건 — 새로 추가된 거래 없음")
+                except Exception as e:
+                    st.error(f"저장 오류: {e}")
