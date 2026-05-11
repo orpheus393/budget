@@ -24,6 +24,8 @@ from email_parser import (
     parse_statement_table,
     parse_statement_text,
     _is_amount_token,
+    _looks_garbled,
+    _clean_merchant_value,
     AD_FOLDER,
     SHOPPING_FOLDER,
     NEWSLETTER_FOLDER,
@@ -297,6 +299,25 @@ assert_eq(mart["금액"], 1891, "bc text 마트할인 절대값")
 sundae = next(t for t in bc_line_txs if "순대국" in t["내역"])
 assert_eq(sundae["내역"], "3대째 소문난 순대국", "bc text 다단어 merchant")
 assert_eq(sundae["금액"], 30000, "bc text 순대국 금액")
+
+# ── 깨진 인코딩 감지 (_looks_garbled) ──
+clean_merchants = ["옥션", "스타벅스 강남점", "(주)이마트의왕점", "CJ CGV"]
+garbled_merchants = ["¡«", "¬©Æ¸⁄Û∞«", "ÔÃ∫‰Æ Íª√Â°", "ßÓÏÓ", "3Î∞ Æ≠"]
+assert_eq(_looks_garbled(clean_merchants), False, "garbled detect: clean korean/english")
+assert_eq(_looks_garbled(garbled_merchants), True, "garbled detect: latin-1 mojibake")
+assert_eq(_looks_garbled([]), False, "garbled detect: empty")
+mixed = ["옥션", "스타벅스", "¡«", "¬©Æ¸"]  # 2/4 = 50% > 33%
+assert_eq(_looks_garbled(mixed), True, "garbled detect: half garbled = garbled")
+one_bad = ["옥션", "스타벅스", "이마트", "¡«"]  # 1/4 = 25% but threshold max(2, 4//3=1) = 2 → not garbled
+assert_eq(_looks_garbled(one_bad), False, "garbled detect: 1/4 below threshold")
+
+# ── _clean_merchant_value: HTML 잔재 정리 ──
+assert_eq(_clean_merchant_value("스타벅스 강남점"), "스타벅스 강남점", "clean plain")
+assert_eq(_clean_merchant_value("스타벅스</td>"), "스타벅스", "clean </td>")
+assert_eq(_clean_merchant_value("<b>이마트</b>"), "이마트", "clean tag pair")
+assert_eq(_clean_merchant_value("AT&amp;T"), "AT&T", "clean entity")
+assert_eq(_clean_merchant_value("  옥션  "), "옥션", "clean whitespace")
+assert_eq(_clean_merchant_value(""), "", "clean empty")
 
 print()
 if FAILED:

@@ -300,10 +300,25 @@ def parse_merchant(text: str, source: str) -> str:
     for pattern in patterns:
         m = re.search(pattern, text)
         if m:
-            value = m.group(1).strip()
-            value = re.sub(r"\s+", " ", value)
-            return value[:50]
+            value = _clean_merchant_value(m.group(1))
+            if value:
+                return value[:50]
     return "알 수 없음"
+
+
+def _clean_merchant_value(value: str) -> str:
+    """가맹점 추출 결과에서 HTML 태그 잔재/엔티티/잡공백 제거"""
+    if not value:
+        return ""
+    # HTML 태그 제거 (`</td>` 같은 잔재 정리)
+    value = re.sub(r"<[^>]+>", " ", value)
+    # HTML 엔티티 디코드
+    value = html_module.unescape(value)
+    # 제로폭/제어문자 제거
+    value = re.sub(r"[​-‏﻿ ]", " ", value)
+    # 공백 정리
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
 
 def guess_category(merchant: str, tx_type: str) -> str:
@@ -647,6 +662,66 @@ def _extract_pdf_text_pymupdf(pdf_bytes: bytes, password: str):
             pass
 
 
+def _extract_pdf_text_pymupdf_ocr(pdf_bytes: bytes, password: str):
+    """PyMuPDF + Tesseract OCR로 페이지 텍스트 추출. 시스템에 tesseract + 한국어 데이터 필요."""
+    try:
+        import fitz
+    except ImportError:
+        print("    [ocr] pymupdf 미설치")
+        return None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        print(f"    [ocr] PDF 열기 실패: {exc}")
+        return None
+    try:
+        if doc.is_encrypted and not doc.authenticate(password):
+            print("    [ocr] 비밀번호 인증 실패")
+            return None
+        pages = []
+        for i, page in enumerate(doc):
+            try:
+                tp = page.get_textpage_ocr(language="kor+eng", dpi=200, full=True)
+                pages.append(page.get_text(textpage=tp) or "")
+            except Exception as exc:
+                print(f"    [ocr] page {i + 1} 실패: {exc}")
+                pages.append("")
+        return pages
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
+# 가맹점명이 깨진 인코딩인지 판정용 — Latin-1 supplement, 기호류 영역
+_GARBLED_RANGES = (
+    (0x00A0, 0x00FF),  # Latin-1 supplement (mojibake에 흔히 등장)
+    (0x0250, 0x02AF),  # IPA Extensions
+    (0x02B0, 0x02FF),  # Spacing Modifier Letters
+    (0x2200, 0x22FF),  # Mathematical Operators
+    (0x2500, 0x257F),  # Box Drawing
+)
+
+
+def _looks_garbled(merchants: list) -> bool:
+    """가맹점명 컬렉션이 한국어가 아닌 의심 문자(Latin-1 등)로 채워져 있는지.
+    한 가맹점에 의심 문자가 1개라도 있으면 'suspect', 전체의 1/3 이상이 suspect면 깨짐."""
+    if not merchants:
+        return False
+
+    def has_suspect(s: str) -> bool:
+        for ch in s:
+            cp = ord(ch)
+            for lo, hi in _GARBLED_RANGES:
+                if lo <= cp <= hi:
+                    return True
+        return False
+
+    suspect_count = sum(1 for m in merchants if has_suspect(m or ""))
+    return suspect_count >= max(2, len(merchants) // 3)
+
+
 def _extract_pdf_with_pdfplumber(pdf_bytes: bytes, password: str,
                                   statement_year: int, statement_month: int) -> list:
     """pdfplumber 기반 추출 (표 우선, 텍스트 fallback). PyMuPDF 실패 시 사용."""
@@ -698,27 +773,49 @@ def _extract_pdf_with_pdfplumber(pdf_bytes: bytes, password: str,
 
 def parse_pdf_transactions(pdf_bytes: bytes, password: str,
                            statement_year: int, statement_month: int) -> list:
-    """비밀번호 PDF에서 거래 추출.
-    한글 PDF는 pdfplumber에서 ToUnicode 매핑 깨짐이 흔하므로 PyMuPDF를 우선 사용.
-    PyMuPDF 실패 시 pdfplumber로 fallback."""
-    all_txs = []
+    """비밀번호 PDF에서 거래 추출. 3-tier 전략:
+    1) PyMuPDF 일반 텍스트 (정상 PDF)
+    2) pdfplumber (표 + 텍스트 fallback)
+    3) PyMuPDF + Tesseract OCR (한글 ToUnicode 매핑 깨진 PDF)
+    1·2 결과의 가맹점명이 깨진 인코딩으로 판정되면 자동으로 OCR로 넘어감."""
 
-    # 1순위: PyMuPDF로 페이지 텍스트 추출 후 라인 단위 파싱
+    # 1순위: PyMuPDF 일반 텍스트
     pages = _extract_pdf_text_pymupdf(pdf_bytes, password)
+    pymupdf_txs = []
     if pages is not None:
         for i, text in enumerate(pages):
             page_txs = parse_statement_text(text, statement_year, statement_month)
             print(f"    [pymupdf] page {i + 1}: txs={len(page_txs)}")
-            all_txs.extend(page_txs)
-        if all_txs:
-            return _dedup_pdf_transactions(all_txs)
-        # PyMuPDF는 텍스트는 뽑았지만 매칭 0건이면 pdfplumber도 시도
-        print("    [pymupdf] 매칭 0건, pdfplumber 재시도")
+            pymupdf_txs.extend(page_txs)
+    if pymupdf_txs and not _looks_garbled([t["내역"] for t in pymupdf_txs]):
+        return _dedup_pdf_transactions(pymupdf_txs)
+    if pymupdf_txs:
+        print("    [pymupdf] 추출됐으나 인코딩 깨짐 감지")
 
-    # 2순위: pdfplumber (표 추출 + 텍스트 fallback)
+    # 2순위: pdfplumber
+    print("    pdfplumber 재시도")
     plumber_txs = _extract_pdf_with_pdfplumber(pdf_bytes, password, statement_year, statement_month)
-    all_txs.extend(plumber_txs)
-    return _dedup_pdf_transactions(all_txs)
+    if plumber_txs and not _looks_garbled([t["내역"] for t in plumber_txs]):
+        return _dedup_pdf_transactions(plumber_txs)
+    if plumber_txs:
+        print("    [pdfplumber] 추출됐으나 인코딩 깨짐 감지")
+
+    # 3순위: PyMuPDF + Tesseract OCR
+    print("    텍스트 레이어 추출 불가 → OCR fallback 시도")
+    ocr_pages = _extract_pdf_text_pymupdf_ocr(pdf_bytes, password)
+    if ocr_pages is None:
+        print("    [ocr] 사용 불가, 깨진 결과라도 반환")
+        # 인코딩 깨졌어도 pymupdf보다는 pdfplumber 결과가 정보량 많음
+        return _dedup_pdf_transactions(plumber_txs or pymupdf_txs)
+    ocr_txs = []
+    for i, text in enumerate(ocr_pages):
+        page_txs = parse_statement_text(text, statement_year, statement_month)
+        print(f"    [ocr] page {i + 1}: txs={len(page_txs)}")
+        ocr_txs.extend(page_txs)
+    if ocr_txs:
+        return _dedup_pdf_transactions(ocr_txs)
+    print("    [ocr] 매칭 0건. PDF 포맷 진단 필요")
+    return _dedup_pdf_transactions(plumber_txs or pymupdf_txs)
 
 
 def _dedup_pdf_transactions(txs: list) -> list:
