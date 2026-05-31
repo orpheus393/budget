@@ -126,9 +126,11 @@ def load_data():
 HYUNDAI_COL_ALIASES = {
     "날짜": ["이용일", "이용일자", "거래일", "거래일자", "사용일", "승인일자", "승인일"],
     "시간": ["이용시간", "거래시간", "승인시간", "승인시각", "사용시간"],
-    "내역": ["가맹점명", "이용가맹점", "가맹점", "이용처", "사용처"],
-    "금액": ["이용금액", "승인금액", "결제금액", "청구금액", "금액", "이용금액(원)"],
-    "구분": ["이용구분", "거래구분", "구분", "할부", "할부개월"],
+    "내역": ["이용가맹점", "가맹점명", "가맹점", "이용처", "사용처"],
+    "이용금액": ["이용금액", "승인금액", "이용금액(원)"],
+    "결제원금": ["결제원금"],  # 명세서: 할부의 이번달 분담액 (BC카드 원금(KRW)과 동일)
+    "구분": ["이용구분", "거래구분", "구분", "할부", "할부개월", "할부/회차"],
+    "카드": ["이용카드", "카드구분", "카드종류"],
 }
 
 
@@ -239,12 +241,14 @@ def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
     df = df.dropna(how="all").reset_index(drop=True)
 
     col_date = _match_column(df.columns, HYUNDAI_COL_ALIASES["날짜"])
-    col_amount = _match_column(df.columns, HYUNDAI_COL_ALIASES["금액"])
+    col_amount = _match_column(df.columns, HYUNDAI_COL_ALIASES["이용금액"])
+    col_payment = _match_column(df.columns, HYUNDAI_COL_ALIASES["결제원금"])
     col_merchant = _match_column(df.columns, HYUNDAI_COL_ALIASES["내역"])
     col_time = _match_column(df.columns, HYUNDAI_COL_ALIASES["시간"])
     col_type = _match_column(df.columns, HYUNDAI_COL_ALIASES["구분"])
+    col_card = _match_column(df.columns, HYUNDAI_COL_ALIASES["카드"])
 
-    if not col_date or not col_amount:
+    if not col_date or not (col_amount or col_payment):
         raise ValueError(
             f"필수 컬럼을 찾을 수 없어요. 감지된 컬럼: {list(df.columns)}"
         )
@@ -256,27 +260,41 @@ def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
     )
     out["출처"] = "현대카드"
 
-    def _to_amount(v):
+    def _to_amount_signed(v):
+        """부호 보존 정수 변환. 음수 거래(취소/환불)를 식별하기 위함."""
         if pd.isna(v):
             return 0
         s = re.sub(r"[^\d\-]", "", str(v))
         try:
-            return abs(int(s)) if s else 0
+            return int(s) if s and s != "-" else 0
         except ValueError:
             return 0
 
-    out["금액"] = df[col_amount].apply(_to_amount)
+    # 결제원금 우선(할부 이번달 분담), 0이거나 비어있으면 이용금액 fallback
+    def _resolve_amount(row):
+        if col_payment is not None:
+            v = _to_amount_signed(row.get(col_payment))
+            if v != 0:
+                return v
+        if col_amount is not None:
+            return _to_amount_signed(row.get(col_amount))
+        return 0
 
-    def _to_type(v):
-        s = str(v) if v is not None else ""
-        if any(k in s for k in ["취소", "환불", "입금"]):
+    raw_amt = df.apply(_resolve_amount, axis=1)
+    out["금액"] = raw_amt.abs()
+
+    # 유형: 음수 거래(매출할인/취소/환불)는 자동 입금, 그 외에는 구분 컬럼 기반
+    def _to_type(idx):
+        v = raw_amt.iloc[idx]
+        if v < 0:
             return "입금"
+        if col_type is not None:
+            s = str(df[col_type].iloc[idx])
+            if any(k in s for k in ["취소", "환불", "입금"]):
+                return "입금"
         return "출금"
 
-    if col_type:
-        out["유형"] = df[col_type].apply(_to_type)
-    else:
-        out["유형"] = "출금"
+    out["유형"] = [_to_type(i) for i in range(len(df))]
 
     out["내역"] = (
         df[col_merchant].astype(str).str.strip() if col_merchant else "현대카드 사용"
@@ -284,12 +302,18 @@ def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
     out["카테고리"] = [
         guess_category(m, t) for m, t in zip(out["내역"], out["유형"])
     ]
-    out["원문"] = "현대카드 업로드"
+    # 원문에 이용카드(본인/가족 X3 등) 보존 — 시트에서 카드별 필터 가능
+    if col_card:
+        out["원문"] = "현대카드 | " + df[col_card].astype(str).str.strip()
+    else:
+        out["원문"] = "현대카드 업로드"
 
-    # 합계/소계 행 제거 (현대카드 HTML 마지막에 "국내 일시불 소계 N건" 등이 붙음)
+    # 합계/소계 행 제거 (현대카드 HTML 마지막에 "국내 일시불 소계 N건",
+    # "본인 소계", "X 할인 소계" 등 보조 합계가 다수)
     SKIP_KEYWORDS = ("소계", "합계", "총계")
-    mask_skip = out["내역"].astype(str).apply(
-        lambda m: any(k in m for k in SKIP_KEYWORDS)
+    out["내역"] = out["내역"].astype(str).str.strip()
+    mask_skip = out["내역"].apply(
+        lambda m: (not m) or any(k in m for k in SKIP_KEYWORDS)
     )
     out = out[~mask_skip]
     # 날짜가 정상 형식(YYYY-MM-DD)이 아닌 행 제거
