@@ -225,6 +225,109 @@ def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
     return out
 
 
+# ── IBK 기업은행 입출금 HTML(.xls) 파서 ─────────────
+def parse_ibk_account_file(uploaded_file) -> pd.DataFrame:
+    """IBK기업은행 거래내역조회 HTML(.xls) → 표준 거래 DataFrame.
+    실제 파일은 HTML 형태의 표를 .xls 확장자로 내려받는 형식이라
+    BeautifulSoup으로 직접 파싱한다."""
+    from bs4 import BeautifulSoup
+
+    raw = uploaded_file.read()
+    if isinstance(raw, bytes):
+        for enc in ("utf-8", "cp949", "euc-kr"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("utf-8", errors="replace")
+    else:
+        text = raw
+
+    soup = BeautifulSoup(text, "lxml")
+    tables = soup.find_all("table")
+    tx_table = None
+    for t in tables:
+        first_row = t.find("tr")
+        if not first_row:
+            continue
+        cells = [td.get_text(strip=True) for td in first_row.find_all(["td", "th"])]
+        if "거래일시" in cells and ("출금" in cells or "입금" in cells):
+            tx_table = t
+            break
+    if tx_table is None:
+        raise ValueError("거래내역 표를 찾을 수 없습니다. 파일 형식 확인 필요.")
+
+    rows = tx_table.find_all("tr")
+    header = [td.get_text(strip=True) for td in rows[0].find_all(["td", "th"])]
+
+    def col_idx(name):
+        try:
+            return header.index(name)
+        except ValueError:
+            return None
+
+    i_dt = col_idx("거래일시")
+    i_out = col_idx("출금")
+    i_in = col_idx("입금")
+    i_content = col_idx("거래내용")
+    i_msg = col_idx("송금메시지")
+    i_bank = col_idx("상대은행")
+    i_type = col_idx("거래구분")
+    i_holder = col_idx("상대계좌예금주명")
+
+    if i_dt is None or i_out is None or i_in is None:
+        raise ValueError(f"필수 컬럼 누락. 감지된 컬럼: {header}")
+
+    def _to_int(s):
+        s = re.sub(r"[^\d\-]", "", str(s or ""))
+        try:
+            return int(s) if s and s != "-" else 0
+        except ValueError:
+            return 0
+
+    txs = []
+    for tr in rows[1:]:
+        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        if not cells or len(cells) <= max(i_dt, i_out, i_in):
+            continue
+        try:
+            dt = datetime.strptime(cells[i_dt], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        out_amt = _to_int(cells[i_out])
+        in_amt = _to_int(cells[i_in])
+        if out_amt > 0:
+            tx_type, amount = "출금", out_amt
+        elif in_amt > 0:
+            tx_type, amount = "입금", in_amt
+        else:
+            continue
+
+        content = cells[i_content] if i_content is not None else ""
+        holder = cells[i_holder] if i_holder is not None else ""
+        kind = cells[i_type] if i_type is not None else ""
+        bank = cells[i_bank] if i_bank is not None else ""
+        msg = cells[i_msg] if i_msg is not None else ""
+
+        merchant = content or holder or msg or "알 수 없음"
+        origin_parts = [p for p in [kind, bank, holder] if p]
+        origin = "IBK통장|" + " / ".join(origin_parts)
+
+        txs.append({
+            "날짜": dt.strftime("%Y-%m-%d"),
+            "시간": dt.strftime("%H:%M"),
+            "출처": "IBK기업은행",
+            "유형": tx_type,
+            "금액": amount,
+            "내역": merchant[:50],
+            "카테고리": guess_category(merchant, tx_type),
+            "원문": origin[:100],
+        })
+    return pd.DataFrame(txs)
+
+
 def append_transactions_to_sheet(transactions: list[dict]) -> int:
     """중복 제외하고 시트에 추가, 추가 건수 반환"""
     ws = get_worksheet()
@@ -441,9 +544,64 @@ if uploaded:
                 num_rows="dynamic",
                 key="hyundai_editor",
             )
-            if st.button("📤 Google Sheets에 저장", type="primary"):
+            if st.button("📤 Google Sheets에 저장", type="primary", key="hyundai_save"):
                 try:
                     transactions = edited.to_dict(orient="records")
+                    added = append_transactions_to_sheet(transactions)
+                    if added:
+                        st.success(f"✅ {added}건 시트에 저장 완료 (중복 {len(transactions) - added}건 제외)")
+                        st.cache_data.clear()
+                    else:
+                        st.info(f"중복 {len(transactions)}건 — 새로 추가된 거래 없음")
+                except Exception as e:
+                    st.error(f"저장 오류: {e}")
+
+
+# ── IBK 기업은행 입출금 통장 업로드 ────────────────────
+st.markdown("---")
+st.subheader("🏦 기업은행 입출금 내역 업로드")
+
+col_ibk_up, col_ibk_info = st.columns([1, 2])
+with col_ibk_up:
+    uploaded_ibk = st.file_uploader(
+        "IBK 입출금 거래내역 (.xls)", type=["xls", "xlsx", "html"], key="ibk_upload"
+    )
+with col_ibk_info:
+    st.markdown("""
+    **IBK기업은행 거래내역 내보내기 방법:**
+    1. i-ONE 뱅크 웹 / 인터넷뱅킹 → 조회 → 거래내역조회(입출식)
+    2. 조회 기간 설정 후 검색
+    3. 우측 "엑셀 다운로드" 클릭 → `.xls` 파일 저장
+    4. 여기에 업로드 → 미리보기 확인 → **시트에 저장**
+    """)
+
+if uploaded_ibk:
+    try:
+        parsed_ibk = parse_ibk_account_file(uploaded_ibk)
+    except Exception as e:
+        st.error(f"파일 파싱 오류: {e}")
+        parsed_ibk = None
+
+    if parsed_ibk is not None:
+        if parsed_ibk.empty:
+            st.warning("거래 내역을 찾지 못했어요. 파일 형식을 확인해주세요.")
+        else:
+            out_sum = parsed_ibk[parsed_ibk["유형"] == "출금"]["금액"].sum()
+            in_sum = parsed_ibk[parsed_ibk["유형"] == "입금"]["금액"].sum()
+            st.success(
+                f"✅ {len(parsed_ibk)}건 파싱됨 — 출금 {out_sum:,.0f}원 / 입금 {in_sum:,.0f}원"
+            )
+            st.caption("⚠️ 같은 거래가 BC카드 명세서·이메일 알림에도 있을 수 있어요. 중복 가능성 확인 후 저장하세요.")
+            edited_ibk = st.data_editor(
+                parsed_ibk,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="ibk_editor",
+            )
+            if st.button("📤 Google Sheets에 저장", type="primary", key="ibk_save"):
+                try:
+                    transactions = edited_ibk.to_dict(orient="records")
                     added = append_transactions_to_sheet(transactions)
                     if added:
                         st.success(f"✅ {added}건 시트에 저장 완료 (중복 {len(transactions) - added}건 제외)")
