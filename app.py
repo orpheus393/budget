@@ -596,6 +596,66 @@ def append_transactions_to_sheet(transactions: list[dict]) -> int:
     return len(new_rows)
 
 
+def recategorize_all_rows() -> tuple[int, int]:
+    """시트 모든 행에 guess_category를 다시 적용. (변경된 건수, 전체 건수) 반환."""
+    ws = get_worksheet()
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return 0, 0
+    header = rows[0]
+    try:
+        cat_idx = header.index("카테고리")
+        type_idx = header.index("유형")
+        merch_idx = header.index("내역")
+    except ValueError:
+        return 0, len(rows) - 1
+
+    cat_col_letter = chr(ord("A") + cat_idx)
+    updates = []
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) <= max(cat_idx, type_idx, merch_idx):
+            continue
+        old_cat = row[cat_idx]
+        new_cat = guess_category(row[merch_idx], row[type_idx])
+        if new_cat != old_cat:
+            updates.append({
+                "range": f"{cat_col_letter}{i}",
+                "values": [[new_cat]],
+            })
+
+    if updates:
+        # 큰 시트는 일부 환경에서 한 번에 보내면 제한에 걸릴 수 있어 500건씩 배치
+        for batch_start in range(0, len(updates), 500):
+            ws.batch_update(
+                updates[batch_start:batch_start + 500],
+                value_input_option="USER_ENTERED",
+            )
+    return len(updates), len(rows) - 1
+
+
+def _maybe_autosave(parsed_df, source_label: str, uploaded_file) -> None:
+    """auto_save 토글이 켜져 있고 같은 파일을 아직 자동 저장한 적 없으면 즉시 시트에 append."""
+    if not st.session_state.get("auto_save_enabled", True):
+        return
+    file_key = f"_autosaved::{source_label}::{uploaded_file.name}::{uploaded_file.size}"
+    if st.session_state.get(file_key):
+        return
+    try:
+        added = append_transactions_to_sheet(parsed_df.to_dict(orient="records"))
+    except Exception as e:
+        st.error(f"⚡ 자동 저장 오류: {e}")
+        return
+    st.session_state[file_key] = True
+    if added:
+        st.success(
+            f"⚡ 자동 저장: {added}건 추가 (중복 {len(parsed_df) - added}건 제외) — "
+            "편집 후 아래 버튼으로 재저장도 가능"
+        )
+        st.cache_data.clear()
+    else:
+        st.info(f"⚡ 자동 저장: 모두 중복 ({len(parsed_df)}건) — 시트 변화 없음")
+
+
 # ── 사이드바 ──────────────────────────────────────────
 st.sidebar.title("💰 가계부")
 st.sidebar.markdown("---")
@@ -641,6 +701,27 @@ if not df.empty:
 if st.sidebar.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
     st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ 동기화 옵션")
+st.sidebar.checkbox(
+    "⚡ 업로드 시 자동 저장",
+    value=True,
+    key="auto_save_enabled",
+    help="파일을 올리면 미리보기와 함께 즉시 시트에 저장합니다. 중복은 자동 제외돼요.",
+)
+
+if st.sidebar.button("🏷️ 카테고리 일괄 재분류", help="새 키워드 규칙을 시트의 모든 기존 행에 소급 적용"):
+    with st.spinner("시트 전체를 재분류 중..."):
+        try:
+            changed, total = recategorize_all_rows()
+            if changed:
+                st.sidebar.success(f"✅ {total}건 중 {changed}건 카테고리 업데이트")
+                st.cache_data.clear()
+            else:
+                st.sidebar.info(f"변경 없음 ({total}건 모두 최신)")
+        except Exception as e:
+            st.sidebar.error(f"재분류 오류: {e}")
 
 st.sidebar.markdown("---")
 st.sidebar.caption("현대카드 내역은 수동 업로드 필요")
@@ -779,6 +860,7 @@ if uploaded:
             st.warning("거래 내역을 찾지 못했어요. 파일 형식을 확인해주세요.")
         else:
             st.success(f"✅ {len(parsed)}건 파싱됨 — 합계 {parsed['금액'].sum():,.0f}원")
+            _maybe_autosave(parsed, "현대카드", uploaded)
             edited = st.data_editor(
                 parsed,
                 use_container_width=True,
@@ -834,6 +916,7 @@ if uploaded_ibk:
                 f"✅ {len(parsed_ibk)}건 파싱됨 — 출금 {out_sum:,.0f}원 / 입금 {in_sum:,.0f}원"
             )
             st.caption("⚠️ 같은 거래가 BC카드 명세서·이메일 알림에도 있을 수 있어요. 중복 가능성 확인 후 저장하세요.")
+            _maybe_autosave(parsed_ibk, "IBK", uploaded_ibk)
             edited_ibk = st.data_editor(
                 parsed_ibk,
                 use_container_width=True,
@@ -895,6 +978,7 @@ if uploaded_kakao:
                 f"✅ {len(parsed_kakao)}건 파싱됨 — 출금 {out_sum:,.0f}원 / 입금 {in_sum:,.0f}원"
             )
             st.caption("⚠️ 카카오뱅크 자동이체로 결제된 카드 거래가 카드 명세서에도 잡힐 수 있어요. 중복 가능성 확인 후 저장하세요.")
+            _maybe_autosave(parsed_kakao, "카카오뱅크", uploaded_kakao)
             edited_kakao = st.data_editor(
                 parsed_kakao,
                 use_container_width=True,
