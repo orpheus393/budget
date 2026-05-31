@@ -26,6 +26,7 @@ from email_parser import (
     _is_amount_token,
     _looks_garbled,
     _clean_merchant_value,
+    _squeeze_korean_spaces,
     AD_FOLDER,
     SHOPPING_FOLDER,
     NEWSLETTER_FOLDER,
@@ -318,6 +319,14 @@ assert_eq(_clean_merchant_value("<b>이마트</b>"), "이마트", "clean tag pai
 assert_eq(_clean_merchant_value("AT&amp;T"), "AT&T", "clean entity")
 assert_eq(_clean_merchant_value("  옥션  "), "옥션", "clean whitespace")
 assert_eq(_clean_merchant_value(""), "", "clean empty")
+
+# ── _squeeze_korean_spaces (OCR 한글 공백 정리) ──
+assert_eq(_squeeze_korean_spaces("굿 모 닝 마트 호 계 점"), "굿모닝마트호계점", "squeeze 한글 공백")
+assert_eq(_squeeze_korean_spaces("위 즈 헤어"), "위즈헤어", "squeeze 위즈헤어")
+assert_eq(_squeeze_korean_spaces("( 주 ) 이마트"), "(주) 이마트", "squeeze 괄호 안")
+assert_eq(_squeeze_korean_spaces("CJ CGV"), "CJ CGV", "squeeze 영문 보존")
+assert_eq(_squeeze_korean_spaces(""), "", "squeeze empty")
+assert_eq(_squeeze_korean_spaces("코오롱글로벌 (주) 스포렉스"), "코오롱글로벌 (주) 스포렉스", "squeeze 영혼")
 
 print()
 if FAILED:
