@@ -270,12 +270,14 @@ def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
         except ValueError:
             return 0
 
-    # 결제원금 우선(할부 이번달 분담), 0이거나 비어있으면 이용금액 fallback
+    # 결제원금 컬럼이 있으면 (월간 명세서 형식) 그것만 사용:
+    # - 양수 결제원금 = 이번달 청구 분담액 → 출금
+    # - 음수 결제원금 = 매출할인/환불 (해당 달에서 차감) → 입금
+    # - 0 = 다음 달로 이월된 거래 (이용금액 음수의 환불도 차기 달 음수 결제원금으로 나타남)
+    # 결제원금 컬럼이 없으면 (실시간 이용내역 형식) 이용금액을 사용
     def _resolve_amount(row):
         if col_payment is not None:
-            v = _to_amount_signed(row.get(col_payment))
-            if v != 0:
-                return v
+            return _to_amount_signed(row.get(col_payment))
         if col_amount is not None:
             return _to_amount_signed(row.get(col_amount))
         return 0
@@ -416,6 +418,127 @@ def parse_ibk_account_file(uploaded_file) -> pd.DataFrame:
             "날짜": dt.strftime("%Y-%m-%d"),
             "시간": dt.strftime("%H:%M"),
             "출처": "IBK기업은행",
+            "유형": tx_type,
+            "금액": amount,
+            "내역": merchant[:50],
+            "카테고리": guess_category(merchant, tx_type),
+            "원문": origin[:100],
+        })
+    return pd.DataFrame(txs)
+
+
+def parse_kakaobank_file(uploaded_file, password: str | None = None) -> pd.DataFrame:
+    """카카오뱅크 거래내역 .xlsx → 표준 거래 DataFrame.
+    카카오뱅크 앱에서 받은 파일은 Microsoft Agile Encryption으로 잠겨있을 수 있어
+    비밀번호(보통 생년월일 6자리)가 필요하다.
+    """
+    raw = uploaded_file.read()
+    buf = io.BytesIO(raw)
+
+    # 암호화 여부 확인 후 복호화
+    try:
+        import msoffcrypto
+        buf.seek(0)
+        of = msoffcrypto.OfficeFile(buf)
+        if of.is_encrypted():
+            if not password:
+                raise ValueError(
+                    "이 파일은 비밀번호로 잠겨있어요. 카카오뱅크에서 다운받을 때 설정한 비밀번호(보통 생년월일 6자리)를 입력해주세요."
+                )
+            decrypted = io.BytesIO()
+            of.load_key(password=password)
+            of.decrypt(decrypted)
+            decrypted.seek(0)
+            buf = decrypted
+        else:
+            buf.seek(0)
+    except ImportError:
+        buf.seek(0)
+    except ValueError:
+        raise
+    except Exception:
+        buf.seek(0)
+
+    df_raw = pd.read_excel(buf, sheet_name=0, header=None)
+
+    # 헤더 행 자동 감지 (거래일시 + 거래금액)
+    header_idx = None
+    for i in range(min(20, len(df_raw))):
+        row = [str(v).strip() for v in df_raw.iloc[i]]
+        if "거래일시" in row and "거래금액" in row:
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError(
+            f"카카오뱅크 거래내역 헤더 행을 찾을 수 없어요. 감지된 첫 행: {list(df_raw.iloc[0])}"
+        )
+
+    df = df_raw.iloc[header_idx + 1:].copy()
+    df.columns = [str(v).strip() for v in df_raw.iloc[header_idx]]
+
+    def col(*aliases):
+        for a in aliases:
+            if a in df.columns:
+                return a
+        return None
+
+    c_dt = col("거래일시")
+    c_kind = col("구분")
+    c_amt = col("거래금액")
+    c_txkind = col("거래구분")
+    c_content = col("내용")
+    c_memo = col("메모")
+    if not c_dt or not c_amt:
+        raise ValueError(f"필수 컬럼 누락. 감지된 컬럼: {list(df.columns)}")
+
+    def _to_int(s):
+        s = re.sub(r"[^\d\-]", "", str(s) if not pd.isna(s) else "")
+        try:
+            return int(s) if s and s != "-" else 0
+        except ValueError:
+            return 0
+
+    txs = []
+    for _, row in df.iterrows():
+        dt_raw = row[c_dt]
+        if pd.isna(dt_raw):
+            continue
+        try:
+            dt = pd.to_datetime(dt_raw)
+        except (ValueError, TypeError):
+            continue
+
+        amt_signed = _to_int(row[c_amt])
+        if amt_signed == 0:
+            continue
+
+        # "구분" 컬럼이 명시되어 있으면 우선 사용, 없으면 부호로 판단
+        kind = str(row[c_kind]).strip() if c_kind and not pd.isna(row[c_kind]) else ""
+        if kind == "출금":
+            tx_type = "출금"
+        elif kind == "입금":
+            tx_type = "입금"
+        else:
+            tx_type = "출금" if amt_signed < 0 else "입금"
+        amount = abs(amt_signed)
+
+        def _cell(name):
+            if not name or name not in df.columns:
+                return ""
+            v = row[name]
+            return "" if pd.isna(v) else str(v).strip()
+
+        content = _cell(c_content)
+        txkind = _cell(c_txkind)
+        memo = _cell(c_memo)
+
+        merchant = content or txkind or "카카오뱅크 거래"
+        origin = " | ".join(p for p in ["카카오뱅크", txkind, memo] if p)
+
+        txs.append({
+            "날짜": dt.strftime("%Y-%m-%d"),
+            "시간": dt.strftime("%H:%M"),
+            "출처": "카카오뱅크",
             "유형": tx_type,
             "금액": amount,
             "내역": merchant[:50],
@@ -699,6 +822,67 @@ if uploaded_ibk:
             if st.button("📤 Google Sheets에 저장", type="primary", key="ibk_save"):
                 try:
                     transactions = edited_ibk.to_dict(orient="records")
+                    added = append_transactions_to_sheet(transactions)
+                    if added:
+                        st.success(f"✅ {added}건 시트에 저장 완료 (중복 {len(transactions) - added}건 제외)")
+                        st.cache_data.clear()
+                    else:
+                        st.info(f"중복 {len(transactions)}건 — 새로 추가된 거래 없음")
+                except Exception as e:
+                    st.error(f"저장 오류: {e}")
+
+
+# ── 카카오뱅크 입출금 내역 업로드 ────────────────────
+st.markdown("---")
+st.subheader("💛 카카오뱅크 거래내역 업로드")
+
+col_kk_up, col_kk_info = st.columns([1, 2])
+with col_kk_up:
+    uploaded_kakao = st.file_uploader(
+        "카카오뱅크 거래내역 (.xlsx)", type=["xlsx"], key="kakao_upload"
+    )
+    kakao_pw = st.text_input(
+        "비밀번호 (잠긴 파일이면 입력)",
+        type="password",
+        key="kakao_pw",
+        placeholder="예: 생년월일 6자리",
+    )
+with col_kk_info:
+    st.markdown("""
+    **카카오뱅크 거래내역 내보내기 방법:**
+    1. 카카오뱅크 앱 → 계좌 선택 → 거래내역
+    2. 우측 상단 메뉴 → **거래내역 내보내기**
+    3. 기간/형식(Excel) 선택 후 비밀번호 설정
+    4. 받은 `.xlsx` 파일 + 비밀번호를 여기에 입력
+    """)
+
+if uploaded_kakao:
+    try:
+        parsed_kakao = parse_kakaobank_file(uploaded_kakao, password=kakao_pw or None)
+    except Exception as e:
+        st.error(f"파일 파싱 오류: {e}")
+        parsed_kakao = None
+
+    if parsed_kakao is not None:
+        if parsed_kakao.empty:
+            st.warning("거래 내역을 찾지 못했어요. 파일 형식을 확인해주세요.")
+        else:
+            out_sum = parsed_kakao[parsed_kakao["유형"] == "출금"]["금액"].sum()
+            in_sum = parsed_kakao[parsed_kakao["유형"] == "입금"]["금액"].sum()
+            st.success(
+                f"✅ {len(parsed_kakao)}건 파싱됨 — 출금 {out_sum:,.0f}원 / 입금 {in_sum:,.0f}원"
+            )
+            st.caption("⚠️ 카카오뱅크 자동이체로 결제된 카드 거래가 카드 명세서에도 잡힐 수 있어요. 중복 가능성 확인 후 저장하세요.")
+            edited_kakao = st.data_editor(
+                parsed_kakao,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="kakao_editor",
+            )
+            if st.button("📤 Google Sheets에 저장", type="primary", key="kakao_save"):
+                try:
+                    transactions = edited_kakao.to_dict(orient="records")
                     added = append_transactions_to_sheet(transactions)
                     if added:
                         st.success(f"✅ {added}건 시트에 저장 완료 (중복 {len(transactions) - added}건 제외)")
