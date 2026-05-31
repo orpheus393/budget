@@ -694,6 +694,226 @@ def _extract_pdf_text_pymupdf_ocr(pdf_bytes: bytes, password: str):
             pass
 
 
+_HYBRID_DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}$")
+# 금액 토큰: 콤마 포함, 또는 3자리 이상 정수 (할부개월·회차 1~2자리는 X 범위로 걸러짐)
+_HYBRID_AMOUNT_RE = re.compile(r"^-?\d{1,3}(?:,\d{3})+$|^-?\d{3,}$")
+_HANGUL_BETWEEN_SPACES = re.compile(r"([가-힣])\s+([가-힣])")
+_OCR_NOISE = {"이", "|", ":", ";", "{", "}", "-", "ｌ", "！", "·", "‧"}
+
+
+def _squeeze_korean_spaces(s: str) -> str:
+    """OCR 결과의 한글 글자 사이 단일 공백 합치기 (`굿 모 닝` → `굿모닝`)"""
+    if not s:
+        return s
+    prev = None
+    while prev != s:
+        prev = s
+        s = _HANGUL_BETWEEN_SPACES.sub(r"\1\2", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # 괄호 안 공백 정리: ( 주 ) → (주)
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    return s
+
+
+def _ocr_page_words(page, dpi: int, scale: float) -> list:
+    """PDF 페이지를 PNG로 렌더링 후 Tesseract TSV로 OCR.
+    반환: [(x_pt, y_pt_center, text), ...] — PDF 좌표계로 변환된 단어 리스트."""
+    import os
+    import subprocess
+    import tempfile
+
+    try:
+        pix = page.get_pixmap(dpi=dpi)
+    except Exception as exc:
+        print(f"    [hybrid] 렌더링 실패: {exc}")
+        return []
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        pix.save(f.name)
+        png_path = f.name
+
+    try:
+        result = subprocess.run(
+            ["tesseract", png_path, "-", "-l", "kor+eng", "--psm", "4", "tsv"],
+            capture_output=True, text=True, timeout=120,
+        )
+        tsv = result.stdout
+    except FileNotFoundError:
+        print("    [hybrid] tesseract 바이너리 없음")
+        return []
+    except subprocess.TimeoutExpired:
+        print("    [hybrid] tesseract 시간 초과")
+        return []
+    finally:
+        try:
+            os.unlink(png_path)
+        except OSError:
+            pass
+
+    words = []
+    for line in tsv.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) < 12:
+            continue
+        try:
+            left = int(parts[6])
+            top = int(parts[7])
+            height = int(parts[9])
+            conf = float(parts[10])
+            text = parts[11].strip()
+        except (ValueError, IndexError):
+            continue
+        if not text or text in _OCR_NOISE or conf < 30:
+            continue
+        # 순수 숫자 토큰은 OCR 부정확 — PDF text로 가져옴
+        if re.fullmatch(r"[\d,.\-]+", text):
+            continue
+        words.append((left / scale, (top + height / 2) / scale, text))
+    return words
+
+
+def _extract_pdf_hybrid(pdf_bytes: bytes, password: str,
+                       statement_year: int, statement_month: int) -> list:
+    """PDF 텍스트(날짜·금액) + OCR(가맹점명) 하이브리드 추출.
+    한국어 ToUnicode가 일부 폰트만 깨진 BC카드 명세서에 최적.
+    PDF text에서 같은 라인(같은 Y) 안의 [date_x_end ~ first_amount_x] X 범위에 있는
+    OCR 단어들을 모아 가맹점명으로 사용."""
+    try:
+        import fitz
+    except ImportError:
+        return []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        print(f"    [hybrid] PDF 열기 실패: {exc}")
+        return []
+    try:
+        if doc.is_encrypted and not doc.authenticate(password):
+            print("    [hybrid] 비밀번호 인증 실패")
+            return []
+
+        DPI = 300
+        SCALE = DPI / 72.0
+        all_txs = []
+
+        for page_idx in range(doc.page_count):
+            page = doc[page_idx]
+            try:
+                words = page.get_text("words") or []
+            except Exception:
+                words = []
+            if not words:
+                continue
+
+            # 같은 Y 좌표에 있는 단어들을 묶어 PDF 행 추출
+            by_y = {}
+            for x0, y0, x1, y1, txt, *_ in words:
+                key = round(y0)
+                by_y.setdefault(key, []).append((x0, x1, y0, y1, txt))
+
+            # BC카드 명세서 컬럼 X 좌표 (300dpi 기준 PDF pt):
+            #  - X≈260 : "이용금액" = 체크(직불) 결제
+            #  - X≈351 : "원금(KRW)" = 신용 결제 (일시불 또는 할부 이번달 분담)
+            # 같은 행에 둘 다 있으면 → 신용 할부 (X=260은 원본 거래액 정보, X=351이 이번달 청구)
+            X_CHECK_RANGE = (250, 290)
+            X_CREDIT_RANGE = (340, 380)
+
+            pdf_rows = []
+            for y_key in sorted(by_y):
+                ws = sorted(by_y[y_key], key=lambda w: w[0])
+                toks = [w[4] for w in ws]
+                if not toks or not _HYBRID_DATE_RE.match(toks[0]):
+                    continue
+                check_amt = None
+                credit_amt = None
+                for w in ws[1:]:
+                    x, _, _, _, txt = w
+                    if not _HYBRID_AMOUNT_RE.match(txt):
+                        continue
+                    if X_CHECK_RANGE[0] <= x <= X_CHECK_RANGE[1] and check_amt is None:
+                        check_amt = (x, txt)
+                    elif X_CREDIT_RANGE[0] <= x <= X_CREDIT_RANGE[1] and credit_amt is None:
+                        credit_amt = (x, txt)
+                # 신용(원금) 컬럼이 있으면 우선 사용 (할부 분담액 또는 신용 일시불)
+                if credit_amt:
+                    use_x, use_amt = credit_amt
+                    card_kind = "신용"
+                elif check_amt:
+                    use_x, use_amt = check_amt
+                    card_kind = "체크"
+                else:
+                    continue
+                # 가맹점 텍스트가 끝나는 X = 첫 금액의 X (체크/신용 중 X 작은 쪽)
+                first_x = min(filter(None, [
+                    check_amt[0] if check_amt else None,
+                    credit_amt[0] if credit_amt else None,
+                ]))
+                pdf_rows.append({
+                    "y_center": (ws[0][2] + ws[0][3]) / 2,
+                    "date_str": toks[0],
+                    "date_x_end": ws[0][1],
+                    "first_amount_x": first_x,
+                    "amount_str": use_amt,
+                    "card_kind": card_kind,
+                })
+
+            if not pdf_rows:
+                print(f"    [hybrid] page {page_idx + 1}: PDF 거래 행 0개, OCR 생략")
+                continue
+
+            ocr_words = _ocr_page_words(page, DPI, SCALE)
+            if not ocr_words:
+                print(f"    [hybrid] page {page_idx + 1}: OCR 0건")
+                continue
+
+            page_txs = []
+            for r in pdf_rows:
+                cands = [
+                    (x, t) for x, y, t in ocr_words
+                    if abs(y - r["y_center"]) <= 7
+                    and r["date_x_end"] + 2 < x < r["first_amount_x"] - 2
+                ]
+                cands.sort(key=lambda c: c[0])
+                merchant = _squeeze_korean_spaces(" ".join(t for _, t in cands))[:50]
+
+                m = re.match(r"(\d{1,2})/(\d{1,2})", r["date_str"])
+                if not m:
+                    continue
+                month, day = int(m.group(1)), int(m.group(2))
+                if not (1 <= month <= 12 and 1 <= day <= 31):
+                    continue
+                year = statement_year - 1 if month > statement_month else statement_year
+                date_iso = f"{year}-{month:02d}-{day:02d}"
+
+                amount = normalize_statement_amount(r["amount_str"])
+                if amount is None or amount == 0:
+                    continue
+
+                if not merchant:
+                    merchant = "알 수 없음"
+                tx_type = "입금" if amount < 0 else "출금"
+                source = f"BC카드({r['card_kind']})"
+                page_txs.append({
+                    "날짜": date_iso,
+                    "시간": "",
+                    "출처": source,
+                    "유형": tx_type,
+                    "금액": abs(amount),
+                    "내역": merchant,
+                    "카테고리": guess_category(merchant, tx_type),
+                    "원문": "BC카드 월간명세서",
+                })
+            all_txs.extend(page_txs)
+            print(f"    [hybrid] page {page_idx + 1}: txs={len(page_txs)}")
+        return all_txs
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
 # 가맹점명이 깨진 인코딩인지 판정용 — Latin-1 supplement, 기호류 영역
 _GARBLED_RANGES = (
     (0x00A0, 0x00FF),  # Latin-1 supplement (mojibake에 흔히 등장)
@@ -773,11 +993,19 @@ def _extract_pdf_with_pdfplumber(pdf_bytes: bytes, password: str,
 
 def parse_pdf_transactions(pdf_bytes: bytes, password: str,
                            statement_year: int, statement_month: int) -> list:
-    """비밀번호 PDF에서 거래 추출. 3-tier 전략:
+    """비밀번호 PDF에서 거래 추출. 4-tier 전략:
+    0) Hybrid (PDF text 날짜/금액 + Tesseract OCR 가맹점 Y좌표 매칭) — BC카드 최적
     1) PyMuPDF 일반 텍스트 (정상 PDF)
     2) pdfplumber (표 + 텍스트 fallback)
-    3) PyMuPDF + Tesseract OCR (한글 ToUnicode 매핑 깨진 PDF)
-    1·2 결과의 가맹점명이 깨진 인코딩으로 판정되면 자동으로 OCR로 넘어감."""
+    3) PyMuPDF + Tesseract OCR (전체 OCR fallback)
+    각 결과의 가맹점명이 깨진 인코딩으로 판정되면 자동으로 다음 티어로 넘어감."""
+
+    # 0순위: Hybrid (BC카드 명세서처럼 가맹점만 깨진 PDF용)
+    hybrid_txs = _extract_pdf_hybrid(pdf_bytes, password, statement_year, statement_month)
+    if hybrid_txs and not _looks_garbled([t["내역"] for t in hybrid_txs]):
+        return _dedup_pdf_transactions(hybrid_txs)
+    if hybrid_txs:
+        print("    [hybrid] 추출됐으나 인코딩 깨짐 감지")
 
     # 1순위: PyMuPDF 일반 텍스트
     pages = _extract_pdf_text_pymupdf(pdf_bytes, password)
