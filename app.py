@@ -9,6 +9,7 @@ from google.oauth2.service_account import Credentials
 import json
 import os
 import re
+import io
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date
@@ -121,10 +122,10 @@ def load_data():
         return pd.DataFrame(columns=["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문"])
 
 
-# ── 현대카드 Excel/CSV 파서 ───────────────────────────
+# ── 현대카드 Excel/CSV/HTML 파서 ──────────────────────
 HYUNDAI_COL_ALIASES = {
     "날짜": ["이용일", "이용일자", "거래일", "거래일자", "사용일", "승인일자", "승인일"],
-    "시간": ["이용시간", "거래시간", "승인시간", "사용시간"],
+    "시간": ["이용시간", "거래시간", "승인시간", "승인시각", "사용시간"],
     "내역": ["가맹점명", "이용가맹점", "가맹점", "이용처", "사용처"],
     "금액": ["이용금액", "승인금액", "결제금액", "청구금액", "금액", "이용금액(원)"],
     "구분": ["이용구분", "거래구분", "구분", "할부", "할부개월"],
@@ -155,21 +156,86 @@ def _match_column(columns, aliases):
     return None
 
 
-def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
-    """현대카드 Excel/CSV → 표준 거래 DataFrame"""
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
+def _read_hyundai_html_as_df(raw_bytes: bytes) -> pd.DataFrame:
+    """HTML 위장 .xls를 DataFrame으로 (헤더 없이 모든 행 포함)"""
+    from bs4 import BeautifulSoup
+    for enc in ("utf-8", "cp949", "euc-kr"):
         try:
-            raw = pd.read_csv(uploaded_file, encoding="cp949", header=None)
+            text = raw_bytes.decode(enc)
+            break
         except UnicodeDecodeError:
-            uploaded_file.seek(0)
-            raw = pd.read_csv(uploaded_file, encoding="utf-8", header=None)
+            continue
     else:
-        raw = pd.read_excel(uploaded_file, header=None)
+        text = raw_bytes.decode("utf-8", errors="replace")
 
-    header_idx = _find_header_row(raw)
-    df = raw.iloc[header_idx + 1:].copy()
-    df.columns = raw.iloc[header_idx].tolist()
+    soup = BeautifulSoup(text, "lxml")
+    tables = soup.find_all("table")
+    # 헤더(별칭 다수 포함)가 있는 표를 우선 선택
+    targets = set(sum(HYUNDAI_COL_ALIASES.values(), []))
+    chosen = None
+    for tbl in tables:
+        for tr in tbl.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            if sum(1 for c in cells if c in targets) >= 2:
+                chosen = tbl
+                break
+        if chosen:
+            break
+    if chosen is None and tables:
+        chosen = tables[0]
+    if chosen is None:
+        raise ValueError("HTML에서 표를 찾을 수 없습니다")
+
+    rows_data = []
+    max_cols = 0
+    for tr in chosen.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        rows_data.append(cells)
+        max_cols = max(max_cols, len(cells))
+    # 길이 정렬
+    rows_data = [r + [""] * (max_cols - len(r)) for r in rows_data]
+    return pd.DataFrame(rows_data)
+
+
+def _normalize_korean_date(s: str) -> str:
+    """`2026년 05월 30일` / `2026.05.30` / `2026-05-30` 등을 ISO로 변환"""
+    if not s:
+        return ""
+    s = str(s).strip()
+    m = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return s
+
+
+def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
+    """현대카드 Excel/CSV/HTML → 표준 거래 DataFrame.
+    현대카드 웹의 .xls 다운로드는 실제로는 HTML 표 형식이므로 자동 감지."""
+    name = (uploaded_file.name or "").lower()
+    raw = uploaded_file.read()
+    if not isinstance(raw, bytes):
+        raw = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+    head = raw[:2048].decode("utf-8", errors="ignore").lower()
+    is_html = ("<html" in head or "<!doctype" in head or "<table" in head
+               or "<script" in head or "<!--" in head)
+
+    if is_html:
+        raw_df = _read_hyundai_html_as_df(raw)
+    elif name.endswith(".csv"):
+        for enc in ("cp949", "utf-8"):
+            try:
+                raw_df = pd.read_csv(io.BytesIO(raw), encoding=enc, header=None)
+                break
+            except (UnicodeDecodeError, pd.errors.ParserError):
+                continue
+        else:
+            raise ValueError("CSV 디코딩 실패")
+    else:
+        raw_df = pd.read_excel(io.BytesIO(raw), header=None)
+
+    header_idx = _find_header_row(raw_df)
+    df = raw_df.iloc[header_idx + 1:].copy()
+    df.columns = raw_df.iloc[header_idx].tolist()
     df = df.dropna(how="all").reset_index(drop=True)
 
     col_date = _match_column(df.columns, HYUNDAI_COL_ALIASES["날짜"])
@@ -184,7 +250,7 @@ def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
         )
 
     out = pd.DataFrame()
-    out["날짜"] = pd.to_datetime(df[col_date], errors="coerce").dt.strftime("%Y-%m-%d")
+    out["날짜"] = df[col_date].astype(str).apply(_normalize_korean_date)
     out["시간"] = (
         df[col_time].astype(str).str.strip() if col_time else ""
     )
@@ -220,7 +286,14 @@ def parse_hyundai_file(uploaded_file) -> pd.DataFrame:
     ]
     out["원문"] = "현대카드 업로드"
 
-    out = out.dropna(subset=["날짜"])
+    # 합계/소계 행 제거 (현대카드 HTML 마지막에 "국내 일시불 소계 N건" 등이 붙음)
+    SKIP_KEYWORDS = ("소계", "합계", "총계")
+    mask_skip = out["내역"].astype(str).apply(
+        lambda m: any(k in m for k in SKIP_KEYWORDS)
+    )
+    out = out[~mask_skip]
+    # 날짜가 정상 형식(YYYY-MM-DD)이 아닌 행 제거
+    out = out[out["날짜"].str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)]
     out = out[out["금액"] > 0].reset_index(drop=True)
     return out
 
@@ -515,7 +588,7 @@ st.subheader("💳 현대카드 내역 업로드")
 
 col_up, col_info = st.columns([1, 2])
 with col_up:
-    uploaded = st.file_uploader("현대카드 Excel/CSV 파일", type=["xlsx", "csv"])
+    uploaded = st.file_uploader("현대카드 Excel/CSV/HTML 파일", type=["xlsx", "xls", "csv", "html"])
 with col_info:
     st.markdown("""
     **현대카드 내역 내보내기 방법:**
