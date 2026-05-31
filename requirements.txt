@@ -8,3 +8,4 @@ pdfplumber>=0.11.0
 pymupdf>=1.24.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
+msoffcrypto-tool>=5.4.0
