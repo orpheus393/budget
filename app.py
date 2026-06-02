@@ -25,9 +25,8 @@ import calendar
 NON_PNL_CATEGORIES = {"어머니차입금", "부채청산", "자기이체", "환불/캐시백"}
 
 # 입금/출금 양방향 매칭 카테고리 (부호와 무관하게 키워드만으로 분류)
+# 어머니차입금/자기이체는 별도 처리(원문에 따라 분기) — guess_category 참조
 BIDIRECTIONAL_RULES = [
-    # (카테고리, 키워드 목록) — 위에서부터 first-match
-    ("어머니차입금", ["임영재"]),
     ("부채청산", ["현대카드", "비씨카드출금", "비씨카드결제", "KB카드출금",
                   "삼성카드출금", "카드결제대금", "카드대금"]),
 ]
@@ -76,38 +75,65 @@ CATEGORY_KEYWORDS = {
 }
 
 
-def guess_category(merchant: str, tx_type: str) -> str:
-    """가맹점/내역 텍스트와 거래 유형(입금/출금)으로 카테고리 추론.
+def guess_category(
+    merchant: str, tx_type: str, origin: str = "", source: str = ""
+) -> str:
+    """가맹점/내역 + 유형 + 원문(상대은행/거래구분) + 출처(은행)로 카테고리 추론.
+
+    임영재 분기는 출처별로 신호가 달라 분기 처리:
+      - IBK 출처:  원문에 "농협" → 어머니차입금 / "카카오뱅크·토스뱅크" → 자기이체
+      - 카뱅 출처: 거래구분 "계좌간자동이체" → 자기이체 / 그 외 → 어머니(보수)
+      - 그 외:     기본 어머니차입금
 
     우선순위:
-    1) 양방향 규칙(어머니차입금/부채청산) — 입출금 무관 키워드 일치
-    2) 입금: 환불·캐시백 키워드 / 그 외는 키워드 매칭 후 fallback "수입"
-    3) 출금: 키워드 매칭, 매칭 없으면 "기타"
+    1) 임영재 분기 (출처+원문)
+    2) 양방향 규칙(부채청산)
+    3) 입금: 환불·캐시백 / 키워드 / fallback "수입"
+    4) 출금: 키워드 / fallback "기타"
     """
     text = (merchant or "")
     text_lower = text.lower()
+    origin_lower = (origin or "").lower()
+    source_norm = (source or "").lower()
 
-    # 1) 양방향 (어머니차입금 / 부채청산)
+    # 1) 임영재 거래
+    if "임영재" in text:
+        if "ibk" in source_norm or "기업은행" in source_norm:
+            if "농협" in origin_lower:
+                return "어머니차입금"
+            if any(b in origin_lower for b in ["카카오뱅크", "카뱅", "토스뱅크"]):
+                return "자기이체"
+            return "어머니차입금"  # 상대은행 미상 시 보수적으로 어머니
+        if "카카오" in source_norm or "카뱅" in source_norm:
+            # 카뱅 origin은 "카카오뱅크 | {거래구분} | {메모}" 형태
+            if "계좌간자동이체" in origin_lower:
+                return "자기이체"
+            return "어머니차입금"
+        # 기타 출처(BC카드 등)에서 임영재가 잡힐 일은 거의 없음
+        return "어머니차입금"
+
+    # 2) 양방향 (부채청산)
     for cat, kws in BIDIRECTIONAL_RULES:
+        if cat == "어머니차입금":
+            continue  # 위에서 처리
         for kw in kws:
             if kw.lower() in text_lower:
                 return cat
 
-    # 2) 입금
+    # 3) 입금
     if tx_type == "입금":
         if any(k in text for k in ["환불", "취소", "캐시백"]):
             return "환불/캐시백"
-        # 입금 쪽 키워드 매칭 (근로소득/기타수입/개인송금)
         for cat in ("근로소득", "기타수입", "개인송금"):
             for kw in CATEGORY_KEYWORDS.get(cat, []):
                 if kw.lower() in text_lower:
                     return cat
         return "수입"
 
-    # 3) 출금
+    # 4) 출금
     for category, keywords in CATEGORY_KEYWORDS.items():
         if category in ("근로소득", "기타수입"):
-            continue  # 입금 전용
+            continue
         for kw in keywords:
             if kw.lower() in text_lower:
                 return category
@@ -490,7 +516,7 @@ def parse_ibk_account_file(uploaded_file) -> pd.DataFrame:
             "유형": tx_type,
             "금액": amount,
             "내역": merchant[:50],
-            "카테고리": guess_category(merchant, tx_type),
+            "카테고리": guess_category(merchant, tx_type, origin, "IBK기업은행"),
             "원문": origin[:100],
         })
     return pd.DataFrame(txs)
@@ -611,7 +637,7 @@ def parse_kakaobank_file(uploaded_file, password: str | None = None) -> pd.DataF
             "유형": tx_type,
             "금액": amount,
             "내역": merchant[:50],
-            "카테고리": guess_category(merchant, tx_type),
+            "카테고리": guess_category(merchant, tx_type, origin, "카카오뱅크"),
             "원문": origin[:100],
         })
     return pd.DataFrame(txs)
@@ -656,6 +682,15 @@ def recategorize_all_rows() -> tuple[int, int]:
         merch_idx = header.index("내역")
     except ValueError:
         return 0, len(rows) - 1
+    # 원문/출처 컬럼은 선택 — 있으면 임영재 분기 정확도 향상
+    try:
+        origin_idx = header.index("원문")
+    except ValueError:
+        origin_idx = None
+    try:
+        source_idx = header.index("출처")
+    except ValueError:
+        source_idx = None
 
     cat_col_letter = chr(ord("A") + cat_idx)
     updates = []
@@ -663,7 +698,9 @@ def recategorize_all_rows() -> tuple[int, int]:
         if len(row) <= max(cat_idx, type_idx, merch_idx):
             continue
         old_cat = row[cat_idx]
-        new_cat = guess_category(row[merch_idx], row[type_idx])
+        origin = row[origin_idx] if origin_idx is not None and len(row) > origin_idx else ""
+        source = row[source_idx] if source_idx is not None and len(row) > source_idx else ""
+        new_cat = guess_category(row[merch_idx], row[type_idx], origin, source)
         if new_cat != old_cat:
             updates.append({
                 "range": f"{cat_col_letter}{i}",
@@ -842,6 +879,36 @@ with col5:
 st.caption(
     "💡 손익은 자기자금 이동(어머니차입금·자기이체)과 카드대금 자동이체(부채청산)를 제외하고 계산합니다."
 )
+
+# ── 💳 카드사용 누계 — 다음달 청구 예고 ─────────────
+CARD_SOURCES = ("현대카드", "BC카드", "삼성카드", "KB카드", "신한카드", "롯데카드", "비씨카드")
+if not df.empty and "출처" in df.columns:
+    card_use = df[
+        df["출처"].isin(CARD_SOURCES)
+        & (df["유형"] == "출금")
+        & (~df["카테고리"].isin(NON_PNL_CATEGORIES))
+    ]
+    if not card_use.empty:
+        st.subheader("💳 이번달 카드사용 누계 (다음달 청구 예고)")
+        rows = []
+        for src in sorted(card_use["출처"].unique()):
+            sub = card_use[card_use["출처"] == src]
+            rows.append({
+                "카드": src,
+                "이번달 사용액": f"{sub['금액'].sum():,.0f}원",
+                "건수": len(sub),
+                "최고 1건": f"{sub['금액'].max():,.0f}원",
+            })
+        total = card_use["금액"].sum()
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        with col_b:
+            st.metric(
+                label="다음달 청구 합계 예상",
+                value=f"{total:,.0f}원",
+                help="이용일 기준 이번달 카드사용 누계. 실제 청구는 카드사별 마감일에 따라 일부 차이가 있을 수 있습니다.",
+            )
 
 st.markdown("<br>", unsafe_allow_html=True)
 
