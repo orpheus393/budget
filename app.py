@@ -24,6 +24,12 @@ import calendar
 # - 환불/캐시백: 가맹점 환불·카드사 캐시백 — 명목 입금이나 수입은 아님
 NON_PNL_CATEGORIES = {"어머니차입금", "부채청산", "자기이체", "환불/캐시백"}
 
+# 고정비(매월 자동 발생, 통제 어려움) vs 변동비(통제 가능)
+# 손익 지출 = 고정비 + 변동비
+FIXED_CATEGORIES = {
+    "주거/관리", "주거/대출", "통신", "구독", "보험/금융", "교육/자녀",
+}
+
 # 입금/출금 양방향 매칭 카테고리 (부호와 무관하게 키워드만으로 분류)
 # 어머니차입금/자기이체는 별도 처리(원문에 따라 분기) — guess_category 참조
 BIDIRECTIONAL_RULES = [
@@ -943,52 +949,119 @@ st.sidebar.caption("현대카드 내역은 수동 업로드 필요")
 # ── 메인 화면 ─────────────────────────────────────────
 st.title(f"💰 {selected_month} 가계부")
 
+
+def _month_pnl(df_src, y, m):
+    """주어진 (연,월)의 손익 지표 반환: (수입, 지출, 손익, 근로소득, 고정비, 변동비)."""
+    if df_src is None or df_src.empty:
+        return 0, 0, 0, 0, 0, 0
+    sub = df_src[(df_src["날짜"].dt.year == y) & (df_src["날짜"].dt.month == m)]
+    if sub.empty:
+        return 0, 0, 0, 0, 0, 0
+    pnl = sub[~sub["카테고리"].isin(NON_PNL_CATEGORIES)]
+    inc = pnl[pnl["유형"] == "입금"]["금액"].sum()
+    exp = pnl[pnl["유형"] == "출금"]["금액"].sum()
+    sal = sub[sub["카테고리"] == "근로소득"]["금액"].sum()
+    fixed = pnl[(pnl["유형"] == "출금") & pnl["카테고리"].isin(FIXED_CATEGORIES)]["금액"].sum()
+    variable = exp - fixed
+    return inc, exp, inc - exp, sal, fixed, variable
+
+
 # 손익(P&L) 정제: 자기자금 이동·부채 변동은 손익에서 제외
+# 카드사용 누계·차트용 (선택된 카테고리 필터 적용된 df 기준)
 df_pnl = df[~df["카테고리"].isin(NON_PNL_CATEGORIES)] if not df.empty else df
-income = df_pnl[df_pnl["유형"] == "입금"]["금액"].sum() if not df_pnl.empty else 0
-expense = df_pnl[df_pnl["유형"] == "출금"]["금액"].sum() if not df_pnl.empty else 0
-balance = income - expense
-salary = (
-    df[df["카테고리"] == "근로소득"]["금액"].sum() if not df.empty else 0
-)
+# 상단 메트릭은 카테고리 필터 무시하고 그 달 전체 손익 (df_all 기준)
+income, expense, balance, salary, fixed_cost, variable_cost = _month_pnl(df_all, year, month) \
+    if not df_all.empty else (0, 0, 0, 0, 0, 0)
+
+# 전월 (Month-over-Month)
+prev_y, prev_m = (year, month - 1) if month > 1 else (year - 1, 12)
+prev_inc, prev_exp, prev_bal, prev_sal, prev_fix, prev_var = _month_pnl(df_all, prev_y, prev_m) \
+    if not df_all.empty else (0, 0, 0, 0, 0, 0)
+
+
+def _delta(curr, prev, money=True):
+    """MoM 증감 표시 문자열 (st.metric의 delta 인자용)."""
+    if prev == 0:
+        return None
+    diff = curr - prev
+    pct = (diff / abs(prev)) * 100
+    sign = "+" if diff >= 0 else ""
+    if money:
+        return f"{sign}{diff:,.0f}원 ({sign}{pct:.1f}%)"
+    return f"{sign}{diff:,.0f} ({sign}{pct:.1f}%)"
+
 
 col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
-    st.markdown(f"""
-    <div class="metric-card metric-income">
-        <div class="metric-label">💼 근로소득</div>
-        <div class="metric-value">{salary:,.0f}원</div>
-    </div>""", unsafe_allow_html=True)
+    st.metric(
+        "💼 근로소득", f"{salary:,.0f}원",
+        delta=_delta(salary, prev_sal),
+        help=f"전월({prev_y}-{prev_m:02d}) 대비 증감",
+    )
 with col2:
-    st.markdown(f"""
-    <div class="metric-card metric-income">
-        <div class="metric-label">💚 총 수입</div>
-        <div class="metric-value">{income:,.0f}원</div>
-    </div>""", unsafe_allow_html=True)
+    st.metric(
+        "💚 총 수입", f"{income:,.0f}원",
+        delta=_delta(income, prev_inc),
+    )
 with col3:
-    st.markdown(f"""
-    <div class="metric-card metric-expense">
-        <div class="metric-label">❤️ 총 지출</div>
-        <div class="metric-value">{expense:,.0f}원</div>
-    </div>""", unsafe_allow_html=True)
+    st.metric(
+        "❤️ 총 지출", f"{expense:,.0f}원",
+        delta=_delta(expense, prev_exp),
+        delta_color="inverse",  # 지출 증가는 빨강
+    )
 with col4:
-    color = "metric-income" if balance >= 0 else "metric-expense"
-    st.markdown(f"""
-    <div class="metric-card {color}">
-        <div class="metric-label">💙 순손익</div>
-        <div class="metric-value">{balance:+,.0f}원</div>
-    </div>""", unsafe_allow_html=True)
+    st.metric(
+        "💙 순손익", f"{balance:+,.0f}원",
+        delta=_delta(balance, prev_bal),
+    )
 with col5:
-    tx_count = len(df) if not df.empty else 0
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">📊 거래 건수</div>
-        <div class="metric-value">{tx_count}건</div>
-    </div>""", unsafe_allow_html=True)
+    # 저축률 = (근로소득 - 지출) / 근로소득
+    if salary > 0:
+        savings_rate = (salary - expense) / salary * 100
+        prev_rate = (prev_sal - prev_exp) / prev_sal * 100 if prev_sal > 0 else 0
+        rate_delta = f"{savings_rate - prev_rate:+.1f}%p" if prev_sal > 0 else None
+    else:
+        savings_rate = 0
+        rate_delta = None
+    st.metric(
+        "💰 저축률",
+        f"{savings_rate:.1f}%",
+        delta=rate_delta,
+        help="근로소득 대비 (근로소득 − 지출) 비율. 음수면 근로소득만으로 부족해 적자.",
+    )
 
 st.caption(
-    "💡 손익은 자기자금 이동(어머니차입금·자기이체)과 카드대금 자동이체(부채청산)를 제외하고 계산합니다."
+    "💡 손익은 자기자금 이동(어머니차입금·자기이체)과 카드대금 자동이체(부채청산)를 제외하고 계산합니다. "
+    "전월 대비 증감은 같은 정제 기준."
 )
+
+# ── 고정비 vs 변동비 + 연간 환산 ─────────────────────
+col_fv, col_yr = st.columns([2, 1])
+with col_fv:
+    if expense > 0:
+        st.markdown("##### 🧱 고정비 vs 변동비")
+        fixed_pct = fixed_cost / expense * 100
+        var_pct = variable_cost / expense * 100
+        fv_df = pd.DataFrame({
+            "구분": ["고정비", "변동비"],
+            "금액": [fixed_cost, variable_cost],
+            "비율": [f"{fixed_pct:.1f}%", f"{var_pct:.1f}%"],
+        })
+        st.dataframe(
+            fv_df.assign(금액=fv_df["금액"].apply(lambda x: f"{x:,.0f}원")),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption(
+            f"고정비 = {' / '.join(sorted(FIXED_CATEGORIES))}"
+        )
+with col_yr:
+    # 연간 환산: 이번 달 기준 × 12 + 시트 전체 평균 × 12 두 가지
+    st.markdown("##### 📅 연간 환산 (12개월)")
+    if salary > 0:
+        st.metric("근로소득 (월×12)", f"{salary * 12:,.0f}원")
+    if balance != 0:
+        st.metric("순손익 (월×12)", f"{balance * 12:+,.0f}원",
+                  delta_color="off")
 
 # ── 💳 카드사용 누계 — 다음달 청구 예고 ─────────────
 CARD_SOURCES = ("현대카드", "BC카드", "삼성카드", "KB카드", "신한카드", "롯데카드", "비씨카드")
