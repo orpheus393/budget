@@ -30,6 +30,8 @@ FIXED_CATEGORIES = {
     "주거/관리", "주거/대출", "통신", "구독", "보험/금융", "교육/자녀",
 }
 
+CARD_SOURCES = ("현대카드", "BC카드", "삼성카드", "KB카드", "신한카드", "롯데카드", "비씨카드")
+
 # 입금/출금 양방향 매칭 카테고리 (부호와 무관하게 키워드만으로 분류)
 # 어머니차입금/자기이체는 별도 처리(원문에 따라 분기) — guess_category 참조
 BIDIRECTIONAL_RULES = [
@@ -999,6 +1001,48 @@ def _month_pnl(df_src, y, m):
     return inc, exp, inc - exp, sal, fixed, variable
 
 
+def _net_worth_snapshot(df_src, year=None, month=None):
+    """현 시점 순자산 스냅샷.
+
+    자산(+): IBK 최근 잔액, 카뱅 최근 잔액(마통이면 음수)
+    부채(−): 어머니 차입금 누적 순증, 이번달 카드사용 누계(다음달 청구)
+    Returns: dict — ibk, kakao, mom_debt, card_debt, net_worth
+    """
+    snap = {"ibk": None, "kakao": None, "mom_debt": 0, "card_debt": 0, "net_worth": None}
+    if df_src is None or df_src.empty:
+        return snap
+
+    if "잔액" in df_src.columns:
+        for src in ("IBK기업은행", "카카오뱅크"):
+            rows = df_src[(df_src["출처"] == src) & df_src["잔액"].notna()]
+            if not rows.empty:
+                latest = rows.sort_values("날짜", ascending=False).iloc[0]
+                key = "ibk" if src == "IBK기업은행" else "kakao"
+                snap[key] = int(latest["잔액"])
+
+    # 어머니차입금 누적 (전체 기간 시트 기준)
+    mom = df_src[df_src["카테고리"] == "어머니차입금"]
+    snap["mom_debt"] = int(
+        mom[mom["유형"] == "입금"]["금액"].sum() - mom[mom["유형"] == "출금"]["금액"].sum()
+    )
+
+    # 이번달 카드 사용 누계 (다음달 청구 예고) — 손익에 포함되는 카드 출금
+    if year and month:
+        card_use = df_src[
+            (df_src["날짜"].dt.year == year)
+            & (df_src["날짜"].dt.month == month)
+            & (df_src["출처"].isin(CARD_SOURCES))
+            & (df_src["유형"] == "출금")
+            & (~df_src["카테고리"].isin(NON_PNL_CATEGORIES))
+        ]
+        snap["card_debt"] = int(card_use["금액"].sum())
+
+    # 순자산 = 잔액합 − 어머니부채 − 카드부채
+    assets = (snap["ibk"] or 0) + (snap["kakao"] or 0)
+    snap["net_worth"] = assets - snap["mom_debt"] - snap["card_debt"]
+    return snap
+
+
 # 손익(P&L) 정제: 자기자금 이동·부채 변동은 손익에서 제외
 # 카드사용 누계·차트용 (선택된 카테고리 필터 적용된 df 기준)
 df_pnl = df[~df["카테고리"].isin(NON_PNL_CATEGORIES)] if not df.empty else df
@@ -1068,6 +1112,50 @@ st.caption(
     "전월 대비 증감은 같은 정제 기준."
 )
 
+# ── 📋 순자산 스냅샷 (자산 − 부채) ───────────────────
+snap = _net_worth_snapshot(df_all, year, month) if not df_all.empty else None
+if snap and (snap["ibk"] is not None or snap["kakao"] is not None or snap["mom_debt"] or snap["card_debt"]):
+    st.markdown("##### 📋 순자산 스냅샷")
+    assets = (snap["ibk"] or 0) + (snap["kakao"] or 0)
+    liabilities = snap["mom_debt"] + snap["card_debt"]
+    nw_col1, nw_col2, nw_col3, nw_col4 = st.columns(4)
+    with nw_col1:
+        parts = []
+        if snap["ibk"] is not None:
+            parts.append(f"IBK {snap['ibk']:+,}")
+        if snap["kakao"] is not None:
+            parts.append(f"카뱅 {snap['kakao']:+,}")
+        st.metric(
+            "💵 자산 (잔액 합)",
+            f"{assets:+,.0f}원",
+            help=" / ".join(parts) if parts else "잔액 데이터 없음 — 재업로드 필요",
+        )
+    with nw_col2:
+        st.metric(
+            "📕 부채 (누적)",
+            f"−{liabilities:,.0f}원" if liabilities else "0원",
+            help=f"어머니차입금 {snap['mom_debt']:+,}원 + 이번달 카드사용 {snap['card_debt']:,}원",
+            delta_color="off",
+        )
+    with nw_col3:
+        nw = snap["net_worth"]
+        st.metric(
+            "🏛️ 순자산",
+            f"{nw:+,.0f}원",
+            help="자산 − 부채. 음수면 부채가 자산보다 큼.",
+        )
+    with nw_col4:
+        if salary > 0:
+            months_to_payoff = abs(min(nw, 0)) / salary if nw < 0 else 0
+            st.metric(
+                "🗓️ 순자산 회복(월)",
+                f"{months_to_payoff:.1f}개월" if nw < 0 else "✅ 흑자",
+                help="현재 월급만으로 순자산이 0이 되려면 몇 개월 필요한지 (현 부채 ÷ 월급)",
+            )
+    st.caption(
+        "💡 카뱅 잔액은 마통이라 음수. 카드 부채는 이번달 사용 누계(다음달 청구)."
+    )
+
 # ── 고정비 vs 변동비 + 연간 환산 ─────────────────────
 col_fv, col_yr = st.columns([2, 1])
 with col_fv:
@@ -1097,7 +1185,6 @@ with col_yr:
                   delta_color="off")
 
 # ── 💳 카드사용 누계 — 다음달 청구 예고 ─────────────
-CARD_SOURCES = ("현대카드", "BC카드", "삼성카드", "KB카드", "신한카드", "롯데카드", "비씨카드")
 if not df.empty and "출처" in df.columns:
     card_use = df[
         df["출처"].isin(CARD_SOURCES)
