@@ -187,6 +187,9 @@ SCOPES = [
 ]
 
 
+SHEET_HEADER = ["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문", "잔액"]
+
+
 def get_worksheet():
     creds_dict = dict(st.secrets["gcp_service_account"])
     sheet_id = st.secrets["GOOGLE_SHEET_ID"]
@@ -196,8 +199,15 @@ def get_worksheet():
     try:
         ws = sheet.worksheet("거래내역")
     except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet("거래내역", rows=10000, cols=10)
-        ws.append_row(["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문"])
+        ws = sheet.add_worksheet("거래내역", rows=10000, cols=12)
+        ws.append_row(SHEET_HEADER)
+        return ws
+    # 기존 시트에 잔액 컬럼 자동 추가 (세션 1회만 체크)
+    if not st.session_state.get("_balance_col_checked"):
+        header = ws.row_values(1)
+        if header and "잔액" not in header:
+            ws.update_cell(1, len(header) + 1, "잔액")
+        st.session_state["_balance_col_checked"] = True
     return ws
 
 
@@ -210,17 +220,19 @@ def load_data():
         df = pd.DataFrame(data)
 
         if df.empty:
-            return pd.DataFrame(columns=["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문"])
+            return pd.DataFrame(columns=SHEET_HEADER)
 
         df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
         df["금액"] = pd.to_numeric(df["금액"], errors="coerce").fillna(0)
+        if "잔액" in df.columns:
+            df["잔액"] = pd.to_numeric(df["잔액"], errors="coerce")
         df = df.dropna(subset=["날짜"])
         df = df.sort_values("날짜", ascending=False)
         return df
 
     except Exception as e:
         st.error(f"데이터 로드 오류: {e}")
-        return pd.DataFrame(columns=["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문"])
+        return pd.DataFrame(columns=SHEET_HEADER)
 
 
 # ── 현대카드 Excel/CSV/HTML 파서 ──────────────────────
@@ -471,6 +483,7 @@ def parse_ibk_account_file(uploaded_file) -> pd.DataFrame:
     i_dt = col_idx("거래일시")
     i_out = col_idx("출금")
     i_in = col_idx("입금")
+    i_balance = col_idx("거래후잔액") or col_idx("잔액") or col_idx("거래 후 잔액")
     i_content = col_idx("거래내용")
     i_msg = col_idx("송금메시지")
     i_bank = col_idx("상대은행")
@@ -510,6 +523,7 @@ def parse_ibk_account_file(uploaded_file) -> pd.DataFrame:
         kind = cells[i_type] if i_type is not None else ""
         bank = cells[i_bank] if i_bank is not None else ""
         msg = cells[i_msg] if i_msg is not None else ""
+        balance = _to_int(cells[i_balance]) if (i_balance is not None and len(cells) > i_balance) else None
 
         merchant = content or holder or msg or "알 수 없음"
         origin_parts = [p for p in [kind, bank, holder] if p]
@@ -524,6 +538,7 @@ def parse_ibk_account_file(uploaded_file) -> pd.DataFrame:
             "내역": merchant[:50],
             "카테고리": guess_category(merchant, tx_type, origin, "IBK기업은행"),
             "원문": origin[:100],
+            "잔액": balance,
         })
     return pd.DataFrame(txs)
 
@@ -586,6 +601,7 @@ def parse_kakaobank_file(uploaded_file, password: str | None = None) -> pd.DataF
     c_dt = col("거래일시")
     c_kind = col("구분")
     c_amt = col("거래금액")
+    c_balance = col("거래 후 잔액", "거래후잔액", "잔액")
     c_txkind = col("거래구분")
     c_content = col("내용")
     c_memo = col("메모")
@@ -632,6 +648,7 @@ def parse_kakaobank_file(uploaded_file, password: str | None = None) -> pd.DataF
         content = _cell(c_content)
         txkind = _cell(c_txkind)
         memo = _cell(c_memo)
+        balance = _to_int(row[c_balance]) if c_balance and not pd.isna(row[c_balance]) else None
 
         merchant = content or txkind or "카카오뱅크 거래"
         origin = " | ".join(p for p in ["카카오뱅크", txkind, memo] if p)
@@ -645,6 +662,7 @@ def parse_kakaobank_file(uploaded_file, password: str | None = None) -> pd.DataF
             "내역": merchant[:50],
             "카테고리": guess_category(merchant, tx_type, origin, "카카오뱅크"),
             "원문": origin[:100],
+            "잔액": balance,
         })
     return pd.DataFrame(txs)
 
@@ -665,9 +683,11 @@ def append_transactions_to_sheet(transactions: list[dict]) -> int:
         if key in existing_keys:
             continue
         existing_keys.add(key)
+        bal = tx.get("잔액")
         new_rows.append([
             tx["날짜"], tx.get("시간", ""), tx["출처"], tx["유형"],
             tx["금액"], tx["내역"], tx["카테고리"], tx.get("원문", ""),
+            "" if bal is None else bal,
         ])
 
     if new_rows:
@@ -943,6 +963,19 @@ if not df_all.empty and "카테고리" in df_all.columns:
             f"빌림 {borrowed:,.0f}원 / 갚음 {repaid:,.0f}원 ({len(mom)}건)"
         )
 
+# 카카오뱅크 마통 잔액 (가장 최근 거래)
+if not df_all.empty and "잔액" in df_all.columns:
+    kk_rows = df_all[(df_all["출처"] == "카카오뱅크") & df_all["잔액"].notna()]
+    if not kk_rows.empty:
+        latest = kk_rows.sort_values("날짜", ascending=False).iloc[0]
+        latest_bal = int(latest["잔액"])
+        st.sidebar.markdown("##### 💛 카카오뱅크 잔액")
+        st.sidebar.metric(
+            label=f"{latest['날짜'].strftime('%Y-%m-%d')} 기준",
+            value=f"{latest_bal:,.0f}원",
+            help="마이너스(−)면 마통 사용 중. 0보다 작아질수록 부채 ↑",
+        )
+
 st.sidebar.markdown("---")
 st.sidebar.caption("현대카드 내역은 수동 업로드 필요")
 
@@ -1172,6 +1205,31 @@ if not df.empty:
             "부채청산: 카드대금 자동이체. 자기이체: 본인 계좌 간 이동. "
             "이 항목들은 위 손익 합계에서 제외됩니다."
         )
+
+    # ── 💛 카뱅 마통 잔액 추이 (시트 전체 기간) ──────────
+    if "잔액" in df_all.columns:
+        kk_hist = df_all[(df_all["출처"] == "카카오뱅크") & df_all["잔액"].notna()].copy()
+        if len(kk_hist) >= 2:
+            st.subheader("💛 카카오뱅크 마통 잔액 추이")
+            kk_hist = kk_hist.sort_values("날짜")
+            fig_bal = px.area(
+                kk_hist, x="날짜", y="잔액",
+                color_discrete_sequence=["#f59e0b"],
+            )
+            fig_bal.add_hline(y=0, line_dash="dash", line_color="gray",
+                              annotation_text="0원", annotation_position="right")
+            fig_bal.update_layout(
+                margin=dict(t=10, b=0, l=0, r=0), height=240,
+                yaxis_title="잔액(원)",
+            )
+            st.plotly_chart(fig_bal, use_container_width=True)
+            start_bal = int(kk_hist.iloc[0]["잔액"])
+            end_bal = int(kk_hist.iloc[-1]["잔액"])
+            diff = end_bal - start_bal
+            st.caption(
+                f"시작 {start_bal:+,}원 → 최근 {end_bal:+,}원, "
+                f"기간 변화 {diff:+,}원 ({'마통 개선' if diff > 0 else '마통 악화'})"
+            )
 
     # ── 거래 내역 테이블 ──────────────────────────────
     st.subheader("📋 거래 내역")
