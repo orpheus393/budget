@@ -1662,29 +1662,49 @@ if not df.empty:
             "이 항목들은 위 손익 합계에서 제외됩니다."
         )
 
-    # ── 💛 카뱅 마통 잔액 추이 (시트 전체 기간) ──────────
+    # ── 💛 카뱅 마통 잔액 추이 + 🔮 3개월 예측 (점선) ─────
     if "잔액" in df_all.columns:
         kk_hist = df_all[(df_all["출처"] == "카카오뱅크") & df_all["잔액"].notna()].copy()
         if len(kk_hist) >= 2:
-            st.subheader("💛 카카오뱅크 마통 잔액 추이")
+            st.subheader("💛 카카오뱅크 마통 잔액 추이 (+ 3개월 예측)")
             kk_hist = kk_hist.sort_values("날짜")
+            # 실측 area
             fig_bal = px.area(
                 kk_hist, x="날짜", y="잔액",
                 color_discrete_sequence=["#f59e0b"],
             )
+            # 예측 점선 — forecast의 예상카뱅잔액
+            forecast_chart = forecast_cash_flow(df_all, months_ahead=3, history_months=3)
+            if not forecast_chart.empty and forecast_chart["예상카뱅잔액"].notna().any():
+                last_real_date = kk_hist["날짜"].max()
+                last_real_bal = int(kk_hist.iloc[-1]["잔액"])
+                pred_dates = [last_real_date]
+                pred_bals = [last_real_bal]
+                for _, r in forecast_chart.iterrows():
+                    period = pd.Period(r["월"], freq="M")
+                    pred_dates.append(period.to_timestamp("M"))  # 월말
+                    pred_bals.append(int(r["예상카뱅잔액"]))
+                fig_bal.add_scatter(
+                    x=pred_dates, y=pred_bals,
+                    mode="lines+markers",
+                    line=dict(dash="dash", color="#dc2626", width=2),
+                    name="3개월 예측",
+                )
             fig_bal.add_hline(y=0, line_dash="dash", line_color="gray",
                               annotation_text="0원", annotation_position="right")
             fig_bal.update_layout(
-                margin=dict(t=10, b=0, l=0, r=0), height=240,
+                margin=dict(t=10, b=0, l=0, r=0), height=280,
                 yaxis_title="잔액(원)",
+                legend=dict(orientation="h", y=1.05),
             )
             st.plotly_chart(fig_bal, use_container_width=True)
             start_bal = int(kk_hist.iloc[0]["잔액"])
             end_bal = int(kk_hist.iloc[-1]["잔액"])
             diff = end_bal - start_bal
             st.caption(
-                f"시작 {start_bal:+,}원 → 최근 {end_bal:+,}원, "
-                f"기간 변화 {diff:+,}원 ({'마통 개선' if diff > 0 else '마통 악화'})"
+                f"실측: 시작 {start_bal:+,}원 → 최근 {end_bal:+,}원 "
+                f"({'마통 개선' if diff > 0 else '마통 악화'} {abs(diff):,}원). "
+                f"점선은 최근 3개월 평균 손익 외삽."
             )
 
     # ── 🏆 TOP 가맹점 + 📈 카테고리별 월별 추이 (시트 전체) ──
