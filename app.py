@@ -1266,6 +1266,57 @@ def _net_worth_snapshot(df_src, year=None, month=None):
     return snap
 
 
+def forecast_cash_flow(
+    df_src, months_ahead: int = 3, history_months: int = 3,
+) -> pd.DataFrame:
+    """최근 history_months 평균 기반으로 다음 months_ahead 개월 현금흐름 예측.
+
+    예상 손익 = 평균 수입 − 평균 지출 (NON_PNL 제외)
+    카뱅 마통 잔액은 현재 잔액 + 누적 손익으로 시뮬레이션.
+
+    Returns: DataFrame [월, 예상수입, 예상지출, 예상손익, 누적손익, 예상카뱅잔액]
+    """
+    if df_src is None or df_src.empty:
+        return pd.DataFrame()
+    pnl = df_src[~df_src["카테고리"].isin(NON_PNL_CATEGORIES)].copy()
+    if pnl.empty:
+        return pd.DataFrame()
+    pnl["월"] = pnl["날짜"].dt.to_period("M")
+    by_month = pnl.groupby(["월", "유형"])["금액"].sum().unstack(fill_value=0)
+    if "입금" not in by_month.columns:
+        by_month["입금"] = 0
+    if "출금" not in by_month.columns:
+        by_month["출금"] = 0
+
+    recent = by_month.tail(history_months)
+    if recent.empty:
+        return pd.DataFrame()
+    avg_inc = float(recent["입금"].mean())
+    avg_exp = float(recent["출금"].mean())
+    avg_pnl = avg_inc - avg_exp
+
+    # 카뱅 현재 잔액
+    kk_rows = df_src[(df_src["출처"] == "카카오뱅크") & df_src["잔액"].notna()] \
+        if "잔액" in df_src.columns else pd.DataFrame()
+    cur_kk = int(kk_rows.sort_values("날짜").iloc[-1]["잔액"]) if not kk_rows.empty else None
+
+    last_month = by_month.index.max()
+    rows = []
+    cum_pnl = 0
+    for i in range(1, months_ahead + 1):
+        future = last_month + i
+        cum_pnl += avg_pnl
+        rows.append({
+            "월": str(future),
+            "예상수입": int(avg_inc),
+            "예상지출": int(avg_exp),
+            "예상손익": int(avg_pnl),
+            "누적손익": int(cum_pnl),
+            "예상카뱅잔액": int(cur_kk + cum_pnl) if cur_kk is not None else None,
+        })
+    return pd.DataFrame(rows)
+
+
 # 손익(P&L) 정제: 자기자금 이동·부채 변동은 손익에서 제외
 # 카드사용 누계·차트용 (선택된 카테고리 필터 적용된 df 기준)
 df_pnl = df[~df["카테고리"].isin(NON_PNL_CATEGORIES)] if not df.empty else df
@@ -1470,6 +1521,33 @@ if not df.empty and "출처" in df.columns:
                 value=f"{total:,.0f}원",
                 help="이용일 기준 이번달 카드사용 누계. 실제 청구는 카드사별 마감일에 따라 일부 차이가 있을 수 있습니다.",
             )
+
+# ── 🔮 3개월 현금흐름 예측 ─────────────────────────
+if not df_all.empty:
+    forecast = forecast_cash_flow(df_all, months_ahead=3, history_months=3)
+    if not forecast.empty:
+        st.subheader("🔮 다음 3개월 현금흐름 예측")
+        show_fc = forecast.copy()
+        for c in ("예상수입", "예상지출", "예상손익", "누적손익"):
+            show_fc[c] = show_fc[c].apply(lambda x: f"{x:+,.0f}원" if c in ("예상손익", "누적손익") else f"{x:,.0f}원")
+        if "예상카뱅잔액" in show_fc.columns and show_fc["예상카뱅잔액"].notna().any():
+            show_fc["예상카뱅잔액"] = show_fc["예상카뱅잔액"].apply(
+                lambda x: f"{x:+,.0f}원" if pd.notna(x) else "-"
+            )
+        st.dataframe(show_fc, use_container_width=True, hide_index=True)
+        last = forecast.iloc[-1]
+        if last["누적손익"] < 0:
+            st.warning(
+                f"⚠️ 최근 3개월 추세대로면 3개월 후 누적 적자 {abs(last['누적손익']):,.0f}원. "
+                f"카뱅 마통이 더 빠지거나 어머니께 추가 차입 필요."
+            )
+        elif last["누적손익"] > 0:
+            st.success(
+                f"✅ 최근 3개월 추세대로면 3개월간 누적 흑자 {last['누적손익']:,.0f}원 예상."
+            )
+        st.caption(
+            "💡 최근 3개월 평균 수입·지출 기반 단순 외삽. 일회성 수입(연말정산·상여)이 빠지면 오차 가능."
+        )
 
 # ── ⚠️ 이상치 알림 (이번달 카테고리 중앙값 대비 3배 초과) ──
 if not df_all.empty:
