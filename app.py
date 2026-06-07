@@ -1471,6 +1471,49 @@ if not df.empty:
                 f"기간 변화 {diff:+,}원 ({'마통 개선' if diff > 0 else '마통 악화'})"
             )
 
+    # ── 🏆 TOP 가맹점 + 📈 카테고리별 월별 추이 (시트 전체) ──
+    if not df_all.empty:
+        tab_top, tab_trend = st.tabs(["🏆 TOP 가맹점", "📈 카테고리 월별 추이"])
+        with tab_top:
+            pnl_all = df_all[
+                ~df_all["카테고리"].isin(NON_PNL_CATEGORIES)
+                & (df_all["유형"] == "출금")
+            ]
+            if pnl_all.empty:
+                st.info("출금 데이터 없음")
+            else:
+                top10 = (
+                    pnl_all.groupby(["내역", "카테고리"])["금액"]
+                    .agg(["count", "sum"])
+                    .sort_values("sum", ascending=False)
+                    .head(10)
+                    .reset_index()
+                    .rename(columns={"count": "건수", "sum": "합계"})
+                )
+                top10["합계"] = top10["합계"].apply(lambda x: f"{x:,.0f}원")
+                st.dataframe(top10, use_container_width=True, hide_index=True)
+                st.caption("시트 전체 기간 출금(손익 포함분) 기준 TOP 10")
+        with tab_trend:
+            pnl_all = df_all[~df_all["카테고리"].isin(NON_PNL_CATEGORIES)].copy()
+            pnl_all["월"] = pnl_all["날짜"].dt.strftime("%Y-%m")
+            exp_trend = (
+                pnl_all[pnl_all["유형"] == "출금"]
+                .groupby(["월", "카테고리"])["금액"].sum().reset_index()
+            )
+            if exp_trend.empty:
+                st.info("추이 데이터 없음")
+            else:
+                fig_trend = px.line(
+                    exp_trend, x="월", y="금액", color="카테고리",
+                    markers=True,
+                )
+                fig_trend.update_layout(
+                    margin=dict(t=10, b=0, l=0, r=0), height=380,
+                    yaxis_title="월별 지출",
+                )
+                st.plotly_chart(fig_trend, use_container_width=True)
+                st.caption("카테고리별 월별 지출 추이 — 손익 포함분만")
+
     # ── 거래 내역 테이블 ──────────────────────────────
     st.subheader("📋 거래 내역")
 
