@@ -1674,6 +1674,55 @@ if not df_all.empty:
             "💡 최근 3개월 평균 수입·지출 기반 단순 외삽. 일회성 수입(연말정산·상여)이 빠지면 오차 가능."
         )
 
+# ── 🏷️ 카테고리 수동 매핑 (앱에서 직접 편집) ──────────
+with st.expander("🏷️ 카테고리 수동 매핑 (특정 가맹점 일괄 변경)"):
+    st.caption(
+        "내역을 정확히 입력하고 카테고리를 선택하면, 시트의 동일 내역 행 전체에 적용됩니다. "
+        "다음 일괄 재분류 시 자동 학습 시스템이 이 매핑을 기억합니다."
+    )
+    # 후보 내역: 시트의 출금 중 카테고리=기타 + 빈도 ≥ 2
+    suggestions = []
+    if not df_all.empty:
+        candidates = df_all[
+            (df_all["유형"] == "출금") & (df_all["카테고리"] == "기타")
+        ]["내역"].value_counts()
+        suggestions = candidates[candidates >= 2].index.tolist()[:30]
+    col_m, col_c, col_b = st.columns([2, 2, 1])
+    with col_m:
+        if suggestions:
+            picked = st.selectbox(
+                "내역 선택 (기타로 분류된 빈도 2+)",
+                ["(직접 입력)"] + suggestions,
+                key="manual_merch_select",
+            )
+            manual_merch = (
+                st.text_input("내역 직접 입력", key="manual_merch_input")
+                if picked == "(직접 입력)" else picked
+            )
+        else:
+            manual_merch = st.text_input("내역 (정확 일치)", placeholder="예: 아이딜컨스트럭션")
+    with col_c:
+        all_cats = sorted(
+            set(CATEGORY_KEYWORDS.keys()) | NON_PNL_CATEGORIES
+            | {"기타", "수입", "근로소득", "기타수입"}
+        )
+        manual_cat = st.selectbox("카테고리", all_cats, key="manual_cat_select")
+    with col_b:
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        if st.button("적용", key="manual_apply"):
+            if manual_merch and manual_merch.strip():
+                try:
+                    n = apply_manual_category(manual_merch, manual_cat)
+                    if n:
+                        st.success(f"✅ '{manual_merch}' → {manual_cat} ({n}건 업데이트)")
+                        st.cache_data.clear()
+                    else:
+                        st.info("변경 없음 (이미 같은 카테고리이거나 매칭 행 없음)")
+                except Exception as e:
+                    st.error(f"오류: {e}")
+            else:
+                st.warning("내역을 입력하세요")
+
 # ── ⚠️ 이상치 알림 (이번달 카테고리 중앙값 대비 3배 초과) ──
 if not df_all.empty:
     outliers = detect_outliers(df_all, year, month, threshold_ratio=3.0)
