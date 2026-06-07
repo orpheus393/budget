@@ -1053,6 +1053,106 @@ def match_card_charges_to_usage(df_src, window_days: int = 35) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("청구일", ascending=False).reset_index(drop=True)
 
 
+def find_invalid_rows() -> list[dict]:
+    """시트 행 중 형식이 이상한 행 식별.
+
+    검사 항목:
+      - 날짜가 YYYY-MM-DD 형식 아닌 행
+      - 유형이 '출금'/'입금'이 아닌 행
+      - 금액이 양의 정수로 파싱 안 되는 행
+      - 출처/내역이 비어있는 행
+
+    Returns: [{행번호, 날짜, 출처, 유형, 금액, 내역, 문제: [...]}]
+    """
+    ws = get_worksheet()
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    header = rows[0]
+    try:
+        date_i = header.index("날짜")
+        src_i = header.index("출처")
+        type_i = header.index("유형")
+        amt_i = header.index("금액")
+        merch_i = header.index("내역")
+    except ValueError:
+        return []
+
+    invalid = []
+    for i, r in enumerate(rows[1:], start=2):
+        problems = []
+        if len(r) <= max(date_i, src_i, type_i, amt_i, merch_i):
+            problems.append("컬럼 부족")
+        else:
+            # 날짜
+            try:
+                datetime.strptime(r[date_i][:10], "%Y-%m-%d")
+            except (ValueError, TypeError):
+                problems.append(f"날짜 형식 오류: '{r[date_i]}'")
+            # 유형
+            if r[type_i].strip() not in ("출금", "입금"):
+                problems.append(f"유형 비정상: '{r[type_i]}'")
+            # 금액
+            try:
+                amt_clean = re.sub(r"[^\d\-]", "", r[amt_i])
+                amt = int(amt_clean) if amt_clean and amt_clean != "-" else 0
+                if amt <= 0:
+                    problems.append(f"금액 0 이하: '{r[amt_i]}'")
+            except (ValueError, TypeError):
+                problems.append(f"금액 파싱 실패: '{r[amt_i]}'")
+            # 출처/내역
+            if not r[src_i].strip():
+                problems.append("출처 누락")
+            if not r[merch_i].strip():
+                problems.append("내역 누락")
+        if problems:
+            invalid.append({
+                "행": i,
+                "날짜": r[date_i] if len(r) > date_i else "",
+                "출처": r[src_i] if len(r) > src_i else "",
+                "유형": r[type_i] if len(r) > type_i else "",
+                "금액": r[amt_i] if len(r) > amt_i else "",
+                "내역": r[merch_i] if len(r) > merch_i else "",
+                "문제": " · ".join(problems),
+            })
+    return invalid
+
+
+def apply_manual_category(merchant: str, category: str) -> int:
+    """주어진 내역의 모든 시트 행 카테고리를 일괄 변경. 변경 건수 반환.
+
+    매칭은 내역 정확 일치(strip 후). 학습 시스템이 같은 매핑을 자동
+    인식해 다음 업로드부터 적용됨.
+    """
+    ws = get_worksheet()
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return 0
+    header = rows[0]
+    try:
+        cat_i = header.index("카테고리")
+        merch_i = header.index("내역")
+    except ValueError:
+        return 0
+    cat_col = chr(ord("A") + cat_i)
+    target = (merchant or "").strip()
+    if not target:
+        return 0
+    updates = []
+    for i, r in enumerate(rows[1:], start=2):
+        if len(r) <= max(cat_i, merch_i):
+            continue
+        if r[merch_i].strip() == target and r[cat_i] != category:
+            updates.append({"range": f"{cat_col}{i}", "values": [[category]]})
+    if updates:
+        for batch_start in range(0, len(updates), 500):
+            ws.batch_update(
+                updates[batch_start:batch_start + 500],
+                value_input_option="USER_ENTERED",
+            )
+    return len(updates)
+
+
 def _maybe_autosave(parsed_df, source_label: str, uploaded_file) -> None:
     """auto_save 토글이 켜져 있고 같은 파일을 아직 자동 저장한 적 없으면 즉시 시트에 append."""
     if not st.session_state.get("auto_save_enabled", True):
@@ -1167,6 +1267,21 @@ if st.sidebar.button(
                 )
         except Exception as e:
             st.sidebar.error(f"페어링 오류: {e}")
+
+if st.sidebar.button(
+    "🧹 시트 정합성 점검",
+    help="날짜·유형·금액·출처·내역 형식이 잘못된 행을 찾아 표시 (CSV import 시 깨진 행 식별용)",
+):
+    with st.spinner("시트 행 검사 중..."):
+        try:
+            st.session_state["_invalid_rows"] = find_invalid_rows()
+            n = len(st.session_state["_invalid_rows"])
+            if n:
+                st.sidebar.warning(f"⚠️ 형식 이상 {n}건 — 메인 화면 확인")
+            else:
+                st.sidebar.success("✅ 모든 행 정상")
+        except Exception as e:
+            st.sidebar.error(f"점검 오류: {e}")
 
 st.sidebar.markdown("---")
 
@@ -1385,6 +1500,16 @@ st.caption(
     "💡 손익은 자기자금 이동(어머니차입금·자기이체)과 카드대금 자동이체(부채청산)를 제외하고 계산합니다. "
     "전월 대비 증감은 같은 정제 기준."
 )
+
+# ── 🧹 시트 정합성 점검 결과 (사이드바 버튼으로 트리거) ──
+if st.session_state.get("_invalid_rows"):
+    invalid = st.session_state["_invalid_rows"]
+    with st.expander(f"🧹 시트 정합성 점검 — 형식 이상 {len(invalid)}건", expanded=True):
+        st.dataframe(pd.DataFrame(invalid), use_container_width=True, hide_index=True)
+        st.caption(
+            "💡 '행' 컬럼의 번호로 시트에서 직접 찾아 수정/삭제 가능. "
+            "수정 후 '🔄 데이터 새로고침'을 누르세요."
+        )
 
 # ── 📋 순자산 스냅샷 (자산 − 부채) ───────────────────
 snap = _net_worth_snapshot(df_all, year, month) if not df_all.empty else None
