@@ -904,6 +904,52 @@ def pair_self_transfers_in_sheet(tolerance_days: int = 2) -> tuple[int, int]:
     return len(matched_kk_rows), len(kk_candidates)
 
 
+def detect_outliers(
+    df_src, year: int, month: int, threshold_ratio: float = 3.0,
+    min_history: int = 5,
+) -> pd.DataFrame:
+    """주어진 (연,월) 거래 중 같은 카테고리 중앙값 대비 N배 초과 거래 추출.
+
+    중앙값(median)은 평균보다 outlier에 robust. 카테고리별 시트 전체
+    이력에서 중앙값을 구하고, 이번 달 거래가 그 배수의 threshold_ratio
+    이상이면 이상치로 표시.
+
+    Returns: DataFrame [날짜, 내역, 카테고리, 금액, 중앙값, 배수]
+    """
+    if df_src is None or df_src.empty:
+        return pd.DataFrame()
+    exp = df_src[
+        (df_src["유형"] == "출금") & ~df_src["카테고리"].isin(NON_PNL_CATEGORIES)
+    ]
+    if exp.empty:
+        return pd.DataFrame()
+    medians = exp.groupby("카테고리")["금액"].agg(["median", "count"])
+    target = exp[
+        (exp["날짜"].dt.year == year) & (exp["날짜"].dt.month == month)
+    ]
+    rows = []
+    for _, r in target.iterrows():
+        info = medians.loc[r["카테고리"]] if r["카테고리"] in medians.index else None
+        if info is None or int(info["count"]) < min_history:
+            continue
+        median_val = float(info["median"])
+        if median_val <= 0:
+            continue
+        ratio = r["금액"] / median_val
+        if ratio >= threshold_ratio:
+            rows.append({
+                "날짜": r["날짜"].strftime("%Y-%m-%d"),
+                "내역": r["내역"],
+                "카테고리": r["카테고리"],
+                "금액": int(r["금액"]),
+                "카테고리 중앙값": int(median_val),
+                "배수": round(ratio, 1),
+            })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("배수", ascending=False).reset_index(drop=True)
+
+
 def match_card_charges_to_usage(df_src, window_days: int = 35) -> pd.DataFrame:
     """카드대금 자동이체(부채청산)와 그 직전 window_days 사용내역 매칭.
 
@@ -1347,6 +1393,21 @@ if not df.empty and "출처" in df.columns:
                 value=f"{total:,.0f}원",
                 help="이용일 기준 이번달 카드사용 누계. 실제 청구는 카드사별 마감일에 따라 일부 차이가 있을 수 있습니다.",
             )
+
+# ── ⚠️ 이상치 알림 (이번달 카테고리 중앙값 대비 3배 초과) ──
+if not df_all.empty:
+    outliers = detect_outliers(df_all, year, month, threshold_ratio=3.0)
+    if not outliers.empty:
+        st.subheader("⚠️ 이상치 알림")
+        show_o = outliers.copy()
+        show_o["금액"] = show_o["금액"].apply(lambda x: f"{x:,.0f}원")
+        show_o["카테고리 중앙값"] = show_o["카테고리 중앙값"].apply(lambda x: f"{x:,.0f}원")
+        show_o["배수"] = show_o["배수"].apply(lambda x: f"×{x}")
+        st.dataframe(show_o, use_container_width=True, hide_index=True)
+        st.caption(
+            "💡 같은 카테고리의 시트 전체 중앙값 대비 3배 이상 큰 거래. "
+            "큰 결제·할부 1회분이거나 카테고리 오분류 신호."
+        )
 
 # ── 💳 카드 청구 ↔ 사용 매칭 (시트 전체 기간) ─────────
 if not df_all.empty:
