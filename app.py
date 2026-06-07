@@ -904,6 +904,48 @@ def pair_self_transfers_in_sheet(tolerance_days: int = 2) -> tuple[int, int]:
     return len(matched_kk_rows), len(kk_candidates)
 
 
+DEFAULT_BUDGET = {
+    "식비": 600000, "교통": 100000, "쇼핑": 300000,
+    "주거/관리": 300000, "주거/대출": 800000,
+    "통신": 100000, "구독": 30000,
+    "보험/금융": 200000, "교육/자녀": 500000,
+    "운동/취미": 100000, "의료": 50000, "여행/항공": 0,
+}
+
+
+def get_budget_worksheet():
+    """예산 워크시트 가져오기/생성 (없으면 디폴트 예산 채워 생성)."""
+    ws_main = get_worksheet()
+    sheet = ws_main.spreadsheet
+    try:
+        return sheet.worksheet("예산")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet("예산", rows=30, cols=3)
+        ws.append_row(["카테고리", "월 예산"])
+        ws.append_rows([[c, v] for c, v in DEFAULT_BUDGET.items()])
+        return ws
+
+
+@st.cache_data(ttl=300)
+def load_budget() -> dict:
+    """예산 워크시트 로드. 시트가 없으면 자동 생성. {카테고리: 월예산}."""
+    try:
+        ws = get_budget_worksheet()
+        budget = {}
+        for r in ws.get_all_records():
+            cat = str(r.get("카테고리", "")).strip()
+            amt_raw = r.get("월 예산", 0)
+            try:
+                amt = int(amt_raw) if amt_raw else 0
+            except (TypeError, ValueError):
+                continue
+            if cat and amt > 0:
+                budget[cat] = amt
+        return budget
+    except Exception:
+        return {}
+
+
 def detect_outliers(
     df_src, year: int, month: int, threshold_ratio: float = 3.0,
     min_history: int = 5,
@@ -1364,6 +1406,41 @@ with col_yr:
     if balance != 0:
         st.metric("순손익 (월×12)", f"{balance * 12:+,.0f}원",
                   delta_color="off")
+
+# ── 💰 카테고리 예산 vs 실제 ───────────────────────
+budget = load_budget()
+if budget and not df_all.empty:
+    month_exp = df_all[
+        (df_all["날짜"].dt.year == year)
+        & (df_all["날짜"].dt.month == month)
+        & (df_all["유형"] == "출금")
+        & ~df_all["카테고리"].isin(NON_PNL_CATEGORIES)
+    ]
+    if not month_exp.empty:
+        st.markdown("##### 💰 카테고리 예산 vs 실제")
+        actuals = month_exp.groupby("카테고리")["금액"].sum().to_dict()
+        rows = []
+        over_count = 0
+        for cat, limit in sorted(budget.items(), key=lambda x: -x[1]):
+            actual = int(actuals.get(cat, 0))
+            pct = (actual / limit * 100) if limit > 0 else 0
+            over = actual > limit
+            if over:
+                over_count += 1
+            rows.append({
+                "카테고리": cat,
+                "예산": f"{limit:,.0f}원",
+                "실제": f"{actual:,.0f}원",
+                "진행률": f"{pct:.0f}%",
+                "상태": "🔴 초과" if over else ("🟡 80%+" if pct >= 80 else "🟢"),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if over_count:
+            st.warning(f"⚠️ {over_count}개 카테고리가 이번달 예산을 초과했습니다.")
+        st.caption(
+            "💡 예산은 시트의 '예산' 워크시트에서 직접 편집. "
+            "처음 실행 시 디폴트 예산이 자동 생성됩니다."
+        )
 
 # ── 💳 카드사용 누계 — 다음달 청구 예고 ─────────────
 if not df.empty and "출처" in df.columns:
