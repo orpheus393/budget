@@ -84,9 +84,13 @@ CATEGORY_KEYWORDS = {
 
 
 def guess_category(
-    merchant: str, tx_type: str, origin: str = "", source: str = ""
+    merchant: str, tx_type: str, origin: str = "", source: str = "",
+    overrides: dict | None = None,
 ) -> str:
     """가맹점/내역 + 유형 + 원문(상대은행/거래구분) + 출처(은행)로 카테고리 추론.
+
+    overrides: {내역 → 카테고리} 학습 매핑. 시트에서 사용자가 직접 수정한
+    분류를 우선 적용. learn_category_overrides()로 생성.
 
     임영재 분기는 출처별로 신호가 달라 분기 처리:
       - IBK 출처:  원문에 "농협" → 어머니차입금 / "카카오뱅크·토스뱅크" → 자기이체
@@ -94,6 +98,7 @@ def guess_category(
       - 그 외:     기본 어머니차입금
 
     우선순위:
+    0) overrides 매핑 (사용자 수동 수정)
     1) 임영재 분기 (출처+원문)
     2) 양방향 규칙(부채청산)
     3) 입금: 환불·캐시백 / 키워드 / fallback "수입"
@@ -103,6 +108,10 @@ def guess_category(
     text_lower = text.lower()
     origin_lower = (origin or "").lower()
     source_norm = (source or "").lower()
+
+    # 0) 사용자 수동 매핑 (학습) 우선
+    if overrides and text in overrides:
+        return overrides[text]
 
     # 1) 임영재 거래
     if "임영재" in text:
@@ -697,19 +706,75 @@ def append_transactions_to_sheet(transactions: list[dict]) -> int:
     return len(new_rows)
 
 
-def recategorize_all_rows() -> tuple[int, int]:
-    """시트 모든 행에 guess_category를 다시 적용. (변경된 건수, 전체 건수) 반환."""
+def learn_category_overrides(
+    rows: list[list[str]], header: list[str],
+    min_count: int = 2, confidence: float = 0.8,
+) -> dict[str, str]:
+    """시트 행에서 (내역 → 카테고리) 매핑 학습.
+
+    같은 내역이 min_count회 이상 나오고, 그중 한 카테고리가 confidence
+    비율 이상이면서 그 카테고리가 키워드 자동 분류 결과와 다르면
+    사용자가 직접 수정한 매핑으로 간주.
+
+    Returns: {내역 → 카테고리}
+    """
+    try:
+        cat_i = header.index("카테고리")
+        merch_i = header.index("내역")
+        type_i = header.index("유형")
+    except ValueError:
+        return {}
+    origin_i = header.index("원문") if "원문" in header else None
+    source_i = header.index("출처") if "출처" in header else None
+
+    from collections import Counter, defaultdict
+    by_merch: dict[str, list[tuple]] = defaultdict(list)
+    for row in rows:
+        if len(row) <= max(cat_i, merch_i, type_i):
+            continue
+        merch = row[merch_i].strip()
+        if not merch:
+            continue
+        cat = row[cat_i].strip()
+        ty = row[type_i].strip()
+        org = row[origin_i] if origin_i is not None and len(row) > origin_i else ""
+        src = row[source_i] if source_i is not None and len(row) > source_i else ""
+        by_merch[merch].append((cat, ty, org, src))
+
+    overrides: dict[str, str] = {}
+    for merch, observations in by_merch.items():
+        if len(observations) < min_count:
+            continue
+        cats = Counter(o[0] for o in observations if o[0])
+        if not cats:
+            continue
+        top_cat, top_n = cats.most_common(1)[0]
+        if top_n / len(observations) < confidence:
+            continue
+        # 키워드 자동 분류와 비교 — 차이날 때만 override로 등록
+        # (자동 분류와 같으면 굳이 학습 안 해도 같은 결과)
+        sample_ty, sample_org, sample_src = observations[0][1:]
+        auto = guess_category(merch, sample_ty, sample_org, sample_src)
+        if auto != top_cat:
+            overrides[merch] = top_cat
+    return overrides
+
+
+def recategorize_all_rows() -> tuple[int, int, int]:
+    """시트 모든 행에 guess_category를 다시 적용.
+    Returns: (변경된 건수, 전체 건수, 학습된 override 건수)
+    """
     ws = get_worksheet()
     rows = ws.get_all_values()
     if len(rows) <= 1:
-        return 0, 0
+        return 0, 0, 0
     header = rows[0]
     try:
         cat_idx = header.index("카테고리")
         type_idx = header.index("유형")
         merch_idx = header.index("내역")
     except ValueError:
-        return 0, len(rows) - 1
+        return 0, len(rows) - 1, 0
     # 원문/출처 컬럼은 선택 — 있으면 임영재 분기 정확도 향상
     try:
         origin_idx = header.index("원문")
@@ -720,6 +785,9 @@ def recategorize_all_rows() -> tuple[int, int]:
     except ValueError:
         source_idx = None
 
+    # 사용자 수동 매핑 학습 — 시트의 현재 (내역 → 카테고리) 분포에서
+    overrides = learn_category_overrides(rows[1:], header)
+
     cat_col_letter = chr(ord("A") + cat_idx)
     updates = []
     for i, row in enumerate(rows[1:], start=2):
@@ -728,7 +796,7 @@ def recategorize_all_rows() -> tuple[int, int]:
         old_cat = row[cat_idx]
         origin = row[origin_idx] if origin_idx is not None and len(row) > origin_idx else ""
         source = row[source_idx] if source_idx is not None and len(row) > source_idx else ""
-        new_cat = guess_category(row[merch_idx], row[type_idx], origin, source)
+        new_cat = guess_category(row[merch_idx], row[type_idx], origin, source, overrides)
         if new_cat != old_cat:
             updates.append({
                 "range": f"{cat_col_letter}{i}",
@@ -742,7 +810,7 @@ def recategorize_all_rows() -> tuple[int, int]:
                 updates[batch_start:batch_start + 500],
                 value_input_option="USER_ENTERED",
             )
-    return len(updates), len(rows) - 1
+    return len(updates), len(rows) - 1, len(overrides)
 
 
 def pair_self_transfers_in_sheet(tolerance_days: int = 2) -> tuple[int, int]:
@@ -917,12 +985,18 @@ st.sidebar.checkbox(
 if st.sidebar.button("🏷️ 카테고리 일괄 재분류", help="새 키워드 규칙을 시트의 모든 기존 행에 소급 적용"):
     with st.spinner("시트 전체를 재분류 중..."):
         try:
-            changed, total = recategorize_all_rows()
+            changed, total, learned = recategorize_all_rows()
             if changed:
-                st.sidebar.success(f"✅ {total}건 중 {changed}건 카테고리 업데이트")
+                msg = f"✅ {total}건 중 {changed}건 업데이트"
+                if learned:
+                    msg += f" · 사용자 수동 매핑 {learned}개 학습 적용"
+                st.sidebar.success(msg)
                 st.cache_data.clear()
             else:
-                st.sidebar.info(f"변경 없음 ({total}건 모두 최신)")
+                info = f"변경 없음 ({total}건 모두 최신)"
+                if learned:
+                    info += f" · 학습 매핑 {learned}개"
+                st.sidebar.info(info)
         except Exception as e:
             st.sidebar.error(f"재분류 오류: {e}")
 
