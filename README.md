@@ -108,3 +108,16 @@ repo → Settings → Secrets and variables → Actions:
 
 ### 사용자 학습 시스템
 시트에서 직접 카테고리를 수정한 행이 같은 내역으로 2회 이상 + 80%+ 일치하면 학습 매핑으로 등록. 다음 일괄 재분류부터 키워드 자동 분류보다 우선 적용.
+
+## 테스트
+
+핵심 함수 회귀 테스트는 `tests/` 디렉토리:
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest tests/ -v
+```
+
+`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 23개 테스트:
+- **test_categorize.py** (14개): guess_category 분기·learn_category_overrides 학습 로직
+- **test_analysis.py** (9개): _month_pnl·_net_worth_snapshot·detect_outliers·forecast_cash_flow·_normalize_korean_date·_delta
