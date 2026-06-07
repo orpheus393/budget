@@ -904,6 +904,67 @@ def pair_self_transfers_in_sheet(tolerance_days: int = 2) -> tuple[int, int]:
     return len(matched_kk_rows), len(kk_candidates)
 
 
+def match_card_charges_to_usage(df_src, window_days: int = 35) -> pd.DataFrame:
+    """카드대금 자동이체(부채청산)와 그 직전 window_days 사용내역 매칭.
+
+    각 청구 행에 대해 같은 카드사 사용 행 합계를 계산해 청구액 vs 사용액
+    차이를 보여줌. 차이가 크면 장기할부·환불·이월 등 정합성 점검 필요.
+    """
+    if df_src is None or df_src.empty:
+        return pd.DataFrame()
+    charges = df_src[
+        (df_src["카테고리"] == "부채청산") & (df_src["유형"] == "출금")
+    ].copy()
+    if charges.empty:
+        return pd.DataFrame()
+
+    def card_of(text: str) -> str | None:
+        t = (text or "").lower()
+        if "현대" in t:
+            return "현대카드"
+        if "비씨" in t or "bc" in t:
+            return "BC카드"
+        if "kb" in t:
+            return "KB카드"
+        if "삼성" in t:
+            return "삼성카드"
+        if "신한" in t:
+            return "신한카드"
+        if "롯데" in t:
+            return "롯데카드"
+        return None
+
+    charges["카드사"] = charges["내역"].apply(card_of)
+    charges = charges.dropna(subset=["카드사"])
+
+    use_df = df_src[
+        df_src["출처"].isin(CARD_SOURCES)
+        & (df_src["유형"] == "출금")
+        & (~df_src["카테고리"].isin(NON_PNL_CATEGORIES))
+    ].copy()
+
+    rows = []
+    for _, ch in charges.iterrows():
+        card = ch["카드사"]
+        charge_date = ch["날짜"]
+        same_card = use_df[use_df["출처"] == card]
+        win_start = charge_date - pd.Timedelta(days=window_days)
+        prior_use = same_card[
+            (same_card["날짜"] >= win_start) & (same_card["날짜"] < charge_date)
+        ]
+        usage = int(prior_use["금액"].sum())
+        charged = int(ch["금액"])
+        rows.append({
+            "청구일": charge_date.strftime("%Y-%m-%d"),
+            "카드사": card,
+            "청구액": charged,
+            f"사용액({window_days}일 직전)": usage,
+            "차이": charged - usage,
+            "사용 건수": len(prior_use),
+        })
+    return pd.DataFrame(rows).sort_values("청구일", ascending=False).reset_index(drop=True)
+
+
 def _maybe_autosave(parsed_df, source_label: str, uploaded_file) -> None:
     """auto_save 토글이 켜져 있고 같은 파일을 아직 자동 저장한 적 없으면 즉시 시트에 append."""
     if not st.session_state.get("auto_save_enabled", True):
@@ -1286,6 +1347,24 @@ if not df.empty and "출처" in df.columns:
                 value=f"{total:,.0f}원",
                 help="이용일 기준 이번달 카드사용 누계. 실제 청구는 카드사별 마감일에 따라 일부 차이가 있을 수 있습니다.",
             )
+
+# ── 💳 카드 청구 ↔ 사용 매칭 (시트 전체 기간) ─────────
+if not df_all.empty:
+    match_df = match_card_charges_to_usage(df_all, window_days=35)
+    if not match_df.empty:
+        st.subheader("💳 카드 청구 ↔ 사용 매칭")
+        show = match_df.copy()
+        usage_col = [c for c in show.columns if c.startswith("사용액")][0]
+        show["청구액"] = show["청구액"].apply(lambda x: f"{x:,.0f}원")
+        show[usage_col] = show[usage_col].apply(lambda x: f"{x:,.0f}원")
+        show["차이"] = match_df["차이"].apply(
+            lambda x: f"{x:+,.0f}원 {'⚠️' if abs(x) > 200000 else ''}"
+        )
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption(
+            "💡 청구액(IBK에서 카드사로 빠진 자동이체) vs 직전 35일 카드 사용 합계. "
+            "차이가 ±20만원 이상이면 ⚠️ 표시 — 장기할부·이월·환불 점검."
+        )
 
 st.markdown("<br>", unsafe_allow_html=True)
 
