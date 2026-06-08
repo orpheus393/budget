@@ -141,3 +141,50 @@ def test_delta_helper():
     assert app._delta(110, 100) == "+10원 (+10.0%)"
     assert app._delta(90, 100) == "-10원 (-10.0%)"
     assert app._delta(100, 0) is None
+
+
+def test_generate_annual_report_basic():
+    df = _build_df([
+        {"날짜": "2026-01-15", "출처": "IBK", "유형": "입금", "금액": 5000000,
+         "내역": "급여", "카테고리": "근로소득", "원문": "", "잔액": 2000000},
+        {"날짜": "2026-01-20", "출처": "현대카드", "유형": "출금", "금액": 100000,
+         "내역": "스타벅스", "카테고리": "식비", "원문": "", "잔액": None},
+        {"날짜": "2026-02-15", "출처": "IBK", "유형": "입금", "금액": 5000000,
+         "내역": "급여", "카테고리": "근로소득", "원문": "", "잔액": 2500000},
+    ])
+    md = app.generate_annual_report(df, 2026)
+    assert "2026년 가계부 결산" in md
+    assert "10,000,000" in md  # 근로소득 5M × 2
+    assert "100,000" in md     # 식비
+    assert "98.0%" in md or "99.0%" in md or "저축률" in md
+    assert "스타벅스" in md  # 가맹점 TOP에 등장
+
+
+def test_generate_annual_report_empty_year():
+    df = _build_df([
+        {"날짜": "2025-01-15", "출처": "IBK", "유형": "입금", "금액": 1000,
+         "내역": "x", "카테고리": "수입", "원문": "", "잔액": None},
+    ])
+    md = app.generate_annual_report(df, 2026)
+    assert "2026년" in md
+    assert "거래 내역이 없습니다" in md
+
+
+def test_build_notification_text_basic():
+    df = _build_df([
+        {"날짜": "2026-05-15", "출처": "IBK", "유형": "입금", "금액": 5000000,
+         "내역": "급여", "카테고리": "근로소득", "원문": "", "잔액": 1000000},
+        {"날짜": "2026-05-20", "출처": "현대카드", "유형": "출금", "금액": 100000,
+         "내역": "스타벅스", "카테고리": "식비", "원문": "", "잔액": None},
+    ])
+    txt = app.build_notification_text(df, 2026, 5)
+    assert "2026년 05월" in txt
+    assert "수입 5,000,000" in txt
+    assert "지출 100,000" in txt
+    assert "저축률" in txt
+
+
+def test_send_slack_notification_no_url():
+    """webhook URL 없으면 False 반환."""
+    assert app.send_slack_notification("test") is False
+    assert app.send_slack_notification("test", webhook_url="") is False

@@ -965,6 +965,77 @@ def save_budget(budget_dict: dict) -> int:
     return len(rows) - 1
 
 
+def build_notification_text(df_src, year: int, month: int) -> str:
+    """이번달 가계부 요약 + 예산 초과 + 이상치 텍스트.
+
+    슬랙 메시지 형식 (markdown subset). df_src·budget·outliers를 한 번에 종합.
+    """
+    inc, exp, bal, sal, fix, var = _month_pnl(df_src, year, month)
+    snap = _net_worth_snapshot(df_src, year, month) if df_src is not None and not df_src.empty else {}
+
+    lines = [f"*💰 {year}년 {month:02d}월 가계부 알림*"]
+    lines.append(f"• 수입 {inc:,} · 지출 {exp:,} · 손익 *{bal:+,}*원")
+    if sal > 0:
+        rate = (sal - exp) / sal * 100
+        lines.append(f"• 저축률 {rate:.1f}% (월급 {sal:,})")
+    if exp > 0:
+        lines.append(f"• 고정비 {fix:,} ({fix/exp*100:.0f}%) · 변동비 {var:,} ({var/exp*100:.0f}%)")
+    if snap.get("kakao") is not None:
+        lines.append(f"• 카뱅 마통 잔액 {snap['kakao']:+,}원")
+    if snap.get("net_worth") is not None:
+        lines.append(f"• 순자산 *{snap['net_worth']:+,}원*")
+
+    # 예산 초과
+    try:
+        budget = load_budget()
+    except Exception:
+        budget = {}
+    if budget and df_src is not None and not df_src.empty:
+        month_exp = df_src[
+            (df_src["날짜"].dt.year == year) & (df_src["날짜"].dt.month == month)
+            & (df_src["유형"] == "출금") & ~df_src["카테고리"].isin(NON_PNL_CATEGORIES)
+        ]
+        actuals = month_exp.groupby("카테고리")["금액"].sum().to_dict()
+        over = []
+        for cat, limit in budget.items():
+            actual = int(actuals.get(cat, 0))
+            if actual > limit:
+                over.append((cat, actual, limit))
+        if over:
+            lines.append(f"\n⚠️ *예산 초과 {len(over)}개*")
+            for cat, a, l in sorted(over, key=lambda x: -(x[1] - x[2]))[:5]:
+                lines.append(f"  • {cat}: {a:,} / 예산 {l:,} (+{a-l:,})")
+
+    # 이상치 (상위 3건만)
+    try:
+        outl = detect_outliers(df_src, year, month, threshold_ratio=3.0)
+    except Exception:
+        outl = pd.DataFrame()
+    if not outl.empty:
+        lines.append(f"\n⚠️ *이상치 {len(outl)}건*")
+        for _, r in outl.head(3).iterrows():
+            lines.append(f"  • {r['날짜']} {r['내역']}: {r['금액']:,}원 ({r['배수']}배)")
+
+    return "\n".join(lines)
+
+
+def send_slack_notification(text: str, webhook_url: str = "") -> bool:
+    """슬랙 incoming webhook으로 메시지 전송. 성공 시 True.
+
+    webhook_url 미지정 시 st.secrets["SLACK_WEBHOOK_URL"] 사용.
+    """
+    import requests
+
+    url = webhook_url or st.secrets.get("SLACK_WEBHOOK_URL", "")
+    if not url:
+        return False
+    try:
+        r = requests.post(url, json={"text": text}, timeout=10)
+        return bool(r.ok)
+    except Exception:
+        return False
+
+
 def detect_outliers(
     df_src, year: int, month: int, threshold_ratio: float = 3.0,
     min_history: int = 5,
@@ -1301,6 +1372,27 @@ if st.sidebar.button(
                 st.sidebar.success("✅ 모든 행 정상")
         except Exception as e:
             st.sidebar.error(f"점검 오류: {e}")
+
+if st.sidebar.button(
+    "📨 슬랙으로 요약 전송",
+    help=(
+        "이번달 손익·예산 초과·이상치를 슬랙 webhook으로 전송. "
+        "secrets에 SLACK_WEBHOOK_URL 설정 필요."
+    ),
+):
+    if not st.secrets.get("SLACK_WEBHOOK_URL"):
+        st.sidebar.error("SLACK_WEBHOOK_URL이 secrets에 없습니다")
+    else:
+        with st.spinner("전송 중..."):
+            try:
+                txt = build_notification_text(df_all, year, month)
+                ok = send_slack_notification(txt)
+                if ok:
+                    st.sidebar.success("✅ 슬랙 전송 완료")
+                else:
+                    st.sidebar.error("전송 실패 — webhook 응답 확인")
+            except Exception as e:
+                st.sidebar.error(f"전송 오류: {e}")
 
 st.sidebar.markdown("---")
 
