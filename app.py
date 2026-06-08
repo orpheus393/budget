@@ -946,6 +946,25 @@ def load_budget() -> dict:
         return {}
 
 
+def save_budget(budget_dict: dict) -> int:
+    """예산 워크시트 전체 재기록. (카테고리, 월예산) 헤더 + 데이터.
+    Returns: 저장된 행 수.
+    """
+    ws = get_budget_worksheet()
+    ws.clear()
+    rows = [["카테고리", "월 예산"]]
+    for cat, amt in budget_dict.items():
+        cat_s = str(cat).strip()
+        try:
+            amt_i = int(amt)
+        except (TypeError, ValueError):
+            continue
+        if cat_s and amt_i >= 0:
+            rows.append([cat_s, amt_i])
+    ws.update("A1", rows, value_input_option="USER_ENTERED")
+    return len(rows) - 1
+
+
 def detect_outliers(
     df_src, year: int, month: int, threshold_ratio: float = 3.0,
     min_history: int = 5,
@@ -1613,10 +1632,46 @@ if budget and not df_all.empty:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         if over_count:
             st.warning(f"⚠️ {over_count}개 카테고리가 이번달 예산을 초과했습니다.")
-        st.caption(
-            "💡 예산은 시트의 '예산' 워크시트에서 직접 편집. "
-            "처음 실행 시 디폴트 예산이 자동 생성됩니다."
-        )
+
+        # 예산 편집 expander
+        with st.expander("✏️ 예산 편집 (앱에서 직접 수정)"):
+            st.caption(
+                "행을 추가/삭제하거나 금액을 수정 후 '저장'을 누르세요. "
+                "신규 카테고리도 추가 가능. 0이거나 빈 값은 저장 시 제외됩니다."
+            )
+            edit_df = pd.DataFrame(
+                [{"카테고리": c, "월 예산": v} for c, v in sorted(budget.items())]
+            )
+            edited = st.data_editor(
+                edit_df,
+                use_container_width=True,
+                num_rows="dynamic",
+                hide_index=True,
+                column_config={
+                    "월 예산": st.column_config.NumberColumn(
+                        "월 예산(원)", min_value=0, step=10000, format="%d"
+                    ),
+                },
+                key="budget_editor",
+            )
+            if st.button("💾 예산 저장", type="primary", key="save_budget"):
+                try:
+                    new_budget = {}
+                    for _, r in edited.iterrows():
+                        cat = str(r.get("카테고리", "")).strip()
+                        amt = r.get("월 예산", 0)
+                        try:
+                            amt_i = int(amt) if pd.notna(amt) else 0
+                        except (TypeError, ValueError):
+                            continue
+                        if cat and amt_i > 0:
+                            new_budget[cat] = amt_i
+                    n = save_budget(new_budget)
+                    st.success(f"✅ {n}개 카테고리 예산 저장 완료")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"저장 오류: {e}")
 
 # ── 💳 카드사용 누계 — 다음달 청구 예고 ─────────────
 if not df.empty and "출처" in df.columns:
