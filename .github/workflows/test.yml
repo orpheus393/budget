@@ -1,0 +1,38 @@
+name: 단위 테스트
+
+on:
+  pull_request:
+    paths:
+      - 'app.py'
+      - 'tests/**'
+      - 'requirements*.txt'
+      - '.github/workflows/test.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'app.py'
+      - 'tests/**'
+      - 'requirements*.txt'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 의존성 설치 (테스트 포함)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: pytest 실행
+        run: python -m pytest tests/ -v --tb=short
