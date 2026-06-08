@@ -43,6 +43,7 @@ SENDER_PATTERNS = {
     "BC카드": ["bcbill@bccard.com", "bccard.com"],
     "카카오뱅크": ["no-reply@mail.kakaobank.com", "kakaobank.com"],
     "현대카드": ["admin@hyundaicard.com", "hyundaicard.com"],
+    "KB카드": ["kbcard.com", "kbcard.co.kr"],  # placeholder — 첫 명세서 도착 후 본문 파서 추가 필요
     "IBK기업은행": ["ibk.co.kr"],
     "네이버페이": ["naverpayadmin_noreply@navercorp.com"],
     "토스페이먼츠": ["bill@bill-mail.tosspayments.com", "tosspayments.com"],
