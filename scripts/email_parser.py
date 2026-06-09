@@ -349,7 +349,96 @@ def classify_non_transaction(sender: str, subject: str) -> str | None:
 
 # ── BC카드 월간 명세서 PDF 파싱 ────────────────────────
 def is_statement_email(subject: str) -> bool:
-    return "이용대금명세서" in subject or "이용대금 명세서" in subject
+    return (
+        "이용대금명세서" in subject
+        or "이용대금 명세서" in subject
+        or "이메일명세서" in subject
+        or "e-메일명세서" in subject
+        or "이용대금" in subject
+    )
+
+
+def parse_kb_email_html(html_text: str) -> list[dict]:
+    """KB국민카드 이메일 명세서 HTML에서 거래 목록 추출.
+
+    KB는 본문 HTML 안의 `var list_pe01Json = [...]` JavaScript 변수에
+    개별 거래(<tr>) 데이터를 임베드한다. PDF 첨부도 아니고 일반 본문
+    텍스트도 아니라 별도 파서 필요.
+
+    각 거래의 cell 순서: [날짜(YY.MM.DD), 매입처구분, 결제유형, 가맹점,
+    공란, 금액, ...]
+    """
+    transactions = []
+
+    # 요약 (pe00) — 청구월·결제일·이용기간
+    bill_month = ""
+    m_summary = re.search(r"var\s+list_pe00Json\s*=\s*\[(.*?)\];", html_text, re.DOTALL)
+    if m_summary:
+        mm = re.search(r'"결제년월일"\s*:\s*"([^"]*)"', m_summary.group(1))
+        if mm:
+            bill_month = mm.group(1).strip()
+
+    # 개별 거래 (pe01)
+    m_tx = re.search(r"var\s+list_pe01Json\s*=\s*\[(.*?)\];", html_text, re.DOTALL)
+    if not m_tx:
+        return transactions
+    body = m_tx.group(1)
+    # KB 포맷: key는 double quote("data"), HTML 값은 single quote로 감쌈
+    rows = re.findall(r'"data"\s*:\s*\'(<tr>.*?</tr>)\'', body, re.DOTALL)
+    if not rows:
+        # 다른 견적 (KB 포맷 변경 대비)
+        rows = re.findall(r"'data'\s*:\s*'(<tr>.*?</tr>)'", body, re.DOTALL)
+        if not rows:
+            rows = re.findall(r'"data"\s*:\s*"(<tr>.*?</tr>)"', body, re.DOTALL)
+
+    for row in rows:
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+        cells = []
+        for td in tds:
+            txt = re.sub(r"<[^>]+>", "", td)
+            txt = html_module.unescape(txt).strip()
+            txt = re.sub(r"\s+", " ", txt)
+            cells.append(txt)
+        if len(cells) < 6 or not cells[0]:
+            continue
+        # 날짜 26.04.30 → 2026-04-30
+        date_str = cells[0]
+        parts = date_str.split(".")
+        if len(parts) != 3:
+            continue
+        try:
+            yy = int(parts[0])
+            month = int(parts[1])
+            day = int(parts[2])
+        except ValueError:
+            continue
+        year = 2000 + yy if yy < 100 else yy
+        date_iso = f"{year:04d}-{month:02d}-{day:02d}"
+
+        # 금액: 6,670 또는 "    6,670" 형태
+        amt_str = re.sub(r"[^\d\-]", "", cells[5])
+        try:
+            amount = int(amt_str) if amt_str and amt_str != "-" else 0
+        except ValueError:
+            continue
+        if amount <= 0:
+            continue
+
+        merchant = cells[3] or "KB카드 사용"
+        pay_type = cells[2] or ""
+        kind = cells[1] or ""
+        origin_parts = [p for p in ["KB", pay_type, kind, f"청구 {bill_month}" if bill_month else ""] if p]
+        transactions.append({
+            "날짜": date_iso,
+            "시간": "",
+            "출처": "KB카드",
+            "유형": "출금",
+            "금액": amount,
+            "내역": merchant[:50],
+            "카테고리": guess_category(merchant, "출금"),
+            "원문": " | ".join(origin_parts)[:100],
+        })
+    return transactions
 
 
 # 은행/카드사가 발송하지만 거래 알림이 아닌 메일 (안내/공지/한도/약관 등)
@@ -1129,8 +1218,11 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict) -> tuple:
                 source = name
                 break
 
-        # BC카드 월간 명세서는 본문에 금액이 없으므로 별도 패스에서 처리
+        # BC카드 / KB카드 월간 명세서는 본문에 금액이 없거나 별도 HTML 구조라
+        # 별도 패스에서 처리한다.
         if source == "BC카드" and is_statement_email(subject):
+            continue
+        if source == "KB카드" and is_statement_email(subject):
             continue
 
         # 은행/카드사 발신이지만 거래가 아닌 안내성 메일은 사전 차단
@@ -1218,6 +1310,82 @@ def prepare_dest_folders(mail) -> dict:
         SNS_FOLDER: ensure_folder(mail, SNS_FOLDER),
     }
     return mapping
+
+
+def process_kb_statements(mail, folders: list, dest_folders: dict) -> tuple:
+    """KB국민카드 이메일 명세서 HTML 처리. (transactions, moved_count) 반환.
+
+    KB는 PDF가 아닌 HTML 본문에 거래를 임베드. BC카드 명세서 패스와
+    별개로 KB 메일을 검색해 본문 HTML을 parse_kb_email_html()에 넘긴다.
+    """
+    transactions = []
+    moved_count = 0
+
+    since = (datetime.now() - timedelta(days=STATEMENT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+
+    for folder in folders:
+        try:
+            status, _ = mail.select(f'"{folder}"', readonly=False)
+            if status != "OK":
+                continue
+            _, data = mail.search(None, f'(SINCE "{since}" FROM "kbcard")')
+            eids = data[0].split() if data and data[0] else []
+        except Exception as exc:
+            print(f"KB 명세서 검색 실패 ({folder}): {exc}")
+            continue
+
+        for eid in eids:
+            try:
+                _, msg_data = mail.fetch(eid, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_str(msg.get("Subject", ""))
+            except Exception as exc:
+                print(f"KB 명세서 FETCH 실패 (eid={eid}): {exc}")
+                continue
+
+            if not is_statement_email(subject):
+                continue
+
+            # KB는 본문 HTML 안에 거래 임베드 — get_email_body는 plain 우선이라
+            # html 원문이 필요. 직접 추출.
+            html_body = ""
+            for part in msg.walk():
+                if part.get_content_type() != "text/html":
+                    continue
+                disp = (part.get("Content-Disposition") or "").lower()
+                if "attachment" in disp:
+                    continue
+                try:
+                    payload = part.get_payload(decode=True)
+                    if payload is None:
+                        continue
+                    cs = part.get_content_charset() or "cp949"
+                    html_body = payload.decode(cs, errors="replace")
+                    break
+                except Exception:
+                    continue
+            if not html_body:
+                print(f"  · KB 명세서 HTML 본문 없음: {subject[:60]}")
+                continue
+
+            print(f"  · KB 명세서 HTML 파싱 중: {subject[:60]}")
+            kb_txs = parse_kb_email_html(html_body)
+            if kb_txs:
+                transactions.extend(kb_txs)
+                print(f"    → {len(kb_txs)}건 추출")
+                if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
+                    if move_email(mail, eid, dest_folders["처리완료"]):
+                        moved_count += 1
+            else:
+                print("    → 추출 0건. KB HTML 포맷 변경 가능성, 로그 확인 필요")
+
+        if ENABLE_EMAIL_CLEANUP:
+            try:
+                mail.expunge()
+            except Exception as exc:
+                print(f"KB 명세서 EXPUNGE 실패 ({folder}): {exc}")
+
+    return transactions, moved_count
 
 
 def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
@@ -1373,6 +1541,14 @@ def main():
             print(f"명세서 처리 실패: {exc}")
     else:
         print("ℹ️  BC_PDF_PASSWORD 미설정: 월간 명세서 PDF 파싱 건너뜀")
+
+    # KB국민카드 이메일 명세서 HTML 별도 패스
+    try:
+        kb_txs, kb_moved = process_kb_statements(mail, IMAP_FOLDERS, dest_folders)
+        all_transactions.extend(kb_txs)
+        total_moved["KB명세서"] = kb_moved
+    except Exception as exc:
+        print(f"KB 명세서 처리 실패: {exc}")
 
     print(f"파싱된 거래: {len(all_transactions)}개")
     if ENABLE_EMAIL_CLEANUP:
