@@ -1,0 +1,31 @@
+name: KB카드 이메일 inspect (수동, 일회용)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: PDF 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'pymupdf>=1.24.0'
+
+      - name: KB 메일 구조 출력
+        env:
+          NAVER_EMAIL: ${{ secrets.NAVER_EMAIL }}
+          NAVER_APP_PW: ${{ secrets.NAVER_APP_PW }}
+          KB_PDF_PASSWORD: ${{ secrets.KB_PDF_PASSWORD }}
+        run: python scripts/inspect_kb_email.py
