@@ -29,7 +29,7 @@ var list_pe01Json = [
 def test_parse_kb_email_html_basic():
     txs = email_parser.parse_kb_email_html(SAMPLE_KB_HTML)
     assert len(txs) == 3
-    # 첫 거래: 스타벅스
+    # 첫 거래: 스타벅스 (일시불 → td5 == td8)
     assert txs[0]["날짜"] == "2026-05-03"
     assert txs[0]["출처"] == "KB카드"
     assert txs[0]["유형"] == "출금"
@@ -38,8 +38,9 @@ def test_parse_kb_email_html_basic():
     # 두 번째: 쿠팡 (HTML entity 디코딩 확인)
     assert txs[1]["내역"] == "쿠팡(쿠페이)-쿠팡(쿠페이)"
     assert txs[1]["금액"] == 17800
-    # 세 번째: 할부
-    assert txs[2]["금액"] == 90000
+    # 세 번째: 할부 — 전체 90,000원이지만 이번달 분담분 30,000원만 가져와야 함
+    # (회계적으로 옳은 것 = IBK 자동이체로 빠지는 금액과 정합)
+    assert txs[2]["금액"] == 30000
     assert "할부" in txs[2]["원문"]
 
 
@@ -68,14 +69,42 @@ def test_parse_kb_email_html_skips_invalid_rows():
     """잘못된 날짜·금액 행은 건너뜀."""
     bad_html = """
     var list_pe01Json = [
-    {"청구일련번호" : 1, "data" : '<tr><td class="first">badDate</td><td>x</td><td>x</td><td>x</td><td></td><td>1000</td></tr>'},
-    {"청구일련번호" : 1, "data" : '<tr><td class="first">26.01.01</td><td>x</td><td>x</td><td>식당</td><td></td><td>notnum</td></tr>'},
-    {"청구일련번호" : 1, "data" : '<tr><td class="first">26.01.02</td><td>x</td><td>x</td><td>식당</td><td></td><td>5,000</td></tr>'},
+    {"청구일련번호" : 1, "data" : '<tr><td class="first">badDate</td><td>x</td><td>x</td><td>x</td><td></td><td>1000</td><td></td><td></td><td>1000</td></tr>'},
+    {"청구일련번호" : 1, "data" : '<tr><td class="first">26.01.01</td><td>x</td><td>x</td><td>식당</td><td></td><td>notnum</td><td></td><td></td><td>notnum</td></tr>'},
+    {"청구일련번호" : 1, "data" : '<tr><td class="first">26.01.02</td><td>x</td><td>x</td><td>식당</td><td></td><td>5,000</td><td></td><td></td><td>5,000</td></tr>'},
     ];
     """
     txs = email_parser.parse_kb_email_html(bad_html)
     assert len(txs) == 1
     assert txs[0]["금액"] == 5000
+
+
+def test_parse_kb_email_html_skips_short_rows():
+    """td 9개 미만 행(합계·안내 행)은 건너뜀."""
+    # KB는 합계/안내 행이 td 8개로 들어옴 — 정상 거래 13개와 구분
+    short_html = """
+    var list_pe01Json = [
+    {"청구일련번호" : 1, "data" : '<tr><td>합계</td><td></td><td></td><td>622,859</td><td></td><td></td><td></td><td></td></tr>'},
+    {"청구일련번호" : 1, "data" : '<tr><td class="first">26.01.05</td><td>국내099</td><td>일시불</td><td>식당</td><td></td><td>10,000</td><td></td><td></td><td>10,000</td></tr>'},
+    ];
+    """
+    txs = email_parser.parse_kb_email_html(short_html)
+    assert len(txs) == 1
+    assert txs[0]["금액"] == 10000
+
+
+def test_parse_kb_email_html_installment_uses_share_not_total():
+    """할부 거래는 분담분(td8)을 가져와야지, 전체(td5)가 아님 — 결제금액과 정합."""
+    # 100,000원 / 5개월 / 2회차 = 분담 20,000원 + 수수료 1,000원
+    halbu_html = """
+    var list_pe01Json = [
+    {"청구일련번호" : 1, "data" : '<tr><td class="first">26.01.10</td><td>국내099</td><td>할부 5개월</td><td>병원</td><td></td><td>100,000</td><td>5</td><td>2</td><td>20,000</td><td>1,000</td></tr>'},
+    ];
+    """
+    txs = email_parser.parse_kb_email_html(halbu_html)
+    assert len(txs) == 1
+    assert txs[0]["금액"] == 20000  # 분담분
+    assert txs[0]["금액"] != 100000  # 전체 아님
 
 
 def test_is_statement_email_handles_kb_subject():

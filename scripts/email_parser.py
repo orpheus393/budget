@@ -399,7 +399,8 @@ def parse_kb_email_html(html_text: str) -> list[dict]:
             txt = html_module.unescape(txt).strip()
             txt = re.sub(r"\s+", " ", txt)
             cells.append(txt)
-        if len(cells) < 6 or not cells[0]:
+        # KB 정상 거래 행은 td 13개. 8개 이하는 합계/안내 행 (skip)
+        if len(cells) < 9 or not cells[0]:
             continue
         # 날짜 26.04.30 → 2026-04-30
         date_str = cells[0]
@@ -415,8 +416,10 @@ def parse_kb_email_html(html_text: str) -> list[dict]:
         year = 2000 + yy if yy < 100 else yy
         date_iso = f"{year:04d}-{month:02d}-{day:02d}"
 
-        # 금액: 6,670 또는 "    6,670" 형태
-        amt_str = re.sub(r"[^\d\-]", "", cells[5])
+        # 회계 기준: td8(이번달 청구 분담분) 우선 사용.
+        # 할부 거래는 td5=전체 이용금액 / td8=N개월 분담분으로 다름.
+        # 일시불은 td5 == td8. 현대카드 파서와 같은 분담 모델 → IBK 자동이체와 정합.
+        amt_str = re.sub(r"[^\d\-]", "", cells[8]) or re.sub(r"[^\d\-]", "", cells[5])
         try:
             amount = int(amt_str) if amt_str and amt_str != "-" else 0
         except ValueError:
