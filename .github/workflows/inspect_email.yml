@@ -1,0 +1,47 @@
+name: 이메일 구조 inspect (수동)
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_filter:
+        description: '발신자 키워드 (예: kbcard, shinhan)'
+        required: true
+        default: 'kbcard'
+      days:
+        description: '검색 일수'
+        required: false
+        default: '60'
+      max_mails:
+        description: '폴더당 최대 메일 수'
+        required: false
+        default: '3'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: PDF 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'pymupdf>=1.24.0'
+
+      - name: 메일 구조 출력
+        env:
+          NAVER_EMAIL: ${{ secrets.NAVER_EMAIL }}
+          NAVER_APP_PW: ${{ secrets.NAVER_APP_PW }}
+          EMAIL_INSPECT_FROM: ${{ github.event.inputs.from_filter }}
+          EMAIL_INSPECT_DAYS: ${{ github.event.inputs.days }}
+          EMAIL_INSPECT_MAX: ${{ github.event.inputs.max_mails }}
+          EMAIL_INSPECT_PDF_PW: ${{ secrets.KB_PDF_PASSWORD }}
+        run: python scripts/inspect_email.py
