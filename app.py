@@ -1204,6 +1204,63 @@ st.sidebar.markdown("---")
 
 df_all = load_data()
 
+
+# ── 📊 데이터 입력 현황 (사이드바 최상단) ─────────────
+# 각 출처별로 시트에 들어있는 행수·최신 거래 날짜·신선도를 보여줘서
+# 어디까지 입력됐고 무엇이 빠졌는지 즉시 파악 가능.
+EXPECTED_SOURCES = (
+    "IBK기업은행", "카카오뱅크", "현대카드",
+    "BC카드(신용)", "BC카드(체크)", "BC카드", "KB카드",
+)
+
+
+def _data_status_rows(df_src):
+    if df_src is None or df_src.empty:
+        return [{"출처": exp, "행수": 0, "최신": "-", "상태": "⚪"} for exp in EXPECTED_SOURCES]
+    today = pd.Timestamp.now().normalize()
+    rows = []
+    seen = set()
+    for src, grp in df_src.groupby("출처"):
+        seen.add(src)
+        latest = grp["날짜"].max()
+        days = (today - latest).days if pd.notna(latest) else None
+        if days is None:
+            badge = "⚪"
+        elif days <= 7:
+            badge = "🟢"
+        elif days <= 35:
+            badge = "🟡"
+        else:
+            badge = "🔴"
+        rows.append({
+            "출처": src,
+            "행수": len(grp),
+            "최신": latest.strftime("%Y-%m-%d") if pd.notna(latest) else "-",
+            "상태": badge,
+        })
+    for exp in EXPECTED_SOURCES:
+        if exp not in seen:
+            rows.append({"출처": exp, "행수": 0, "최신": "-", "상태": "⚪"})
+    # 행수 많은 순 (미입력=0은 맨 아래)
+    return sorted(rows, key=lambda r: (-r["행수"], r["출처"]))
+
+
+with st.sidebar.expander("📊 데이터 입력 현황", expanded=True):
+    status_rows = _data_status_rows(df_all)
+    for r in status_rows:
+        if r["행수"] == 0:
+            st.markdown(f"⚪ **{r['출처']}** — 미입력")
+        else:
+            st.markdown(
+                f"{r['상태']} **{r['출처']}** — {r['행수']:,}건 · 최신 {r['최신']}"
+            )
+    st.caption(
+        "🟢 1주 이내 · 🟡 1개월 이내 · 🔴 1개월+ 오래됨 · ⚪ 아직 입력 안 됨. "
+        "업로드 후 안 보이면 🔄 데이터 새로고침 눌러보세요."
+    )
+
+st.sidebar.markdown("---")
+
 if not df_all.empty:
     min_date = df_all["날짜"].min().date()
     max_date = df_all["날짜"].max().date()
