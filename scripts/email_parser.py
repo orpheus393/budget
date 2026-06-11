@@ -1198,8 +1198,10 @@ def fetch_recent_ids(mail, folder: str, hours: int) -> list:
     return data[0].split() if data and data[0] else []
 
 
-def process_folder(mail, folder: str, hours: int, dest_folders: dict) -> tuple:
+def process_folder(mail, folder: str, hours: int, dest_folders: dict,
+                   cleanup_log: dict | None = None) -> tuple:
     """한 폴더를 처리: 거래 추출 + 비거래 분류 이동.
+    cleanup_log: {카테고리: [제목,...]} — 정리 요약용. 전달 시 분류된 제목 수집.
     반환: (transactions, moved_counts dict)"""
     transactions = []
     moved = {"거래": 0, "쇼핑": 0, "SNS": 0, "뉴스레터": 0, "광고": 0}
@@ -1289,11 +1291,17 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict) -> tuple:
         encoded = dest_folders.get(category_folder)
         if not encoded:
             continue
+        # move_email은 mark_seen=True라 이동과 동시에 읽음 처리됨.
+        # 홍보(광고) 메일도 여기서 읽음+이동으로 함께 정리된다.
         if move_email(mail, eid, encoded):
-            # 카운트 키 매핑
+            # 카운트 키 매핑 + 요약 로그 수집
             for cat_name, folder_name, _, _ in NON_TX_CATEGORIES:
                 if folder_name == category_folder:
                     moved[cat_name] = moved.get(cat_name, 0) + 1
+                    if cleanup_log is not None:
+                        cleanup_log.setdefault(cat_name, []).append(
+                            decode_str(subject).strip()[:60]
+                        )
                     break
 
     # EXPUNGE는 select가 풀린 후엔 무효 — 폴더별로 마지막에 호출
@@ -1481,11 +1489,11 @@ def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
 
                 # IBK BC카드는 비암호 PDF, BC카드 본사는 비번 필요.
                 # 일단 비번 없이 시도, 실패하면 BC_PDF_PASSWORD로 재시도.
-                is_ibk = "ibk" in sender.lower()
-                source_label = "BC카드"  # 둘 다 BC카드 거래
+                # bccard.com / ibk.co.kr 둘 다 같은 BC카드 명세서 (사용자 카드는
+                # IBK 발급 BC카드 하나) → 출처·파서·출력 동일하게 통일.
                 print(
-                    f"  · 명세서 PDF 파싱 중: {fname or '(이름 없음)'} "
-                    f"({len(pdf_bytes):,}B, 발신:{'IBK' if is_ibk else 'BC'})"
+                    f"  · BC카드 명세서 PDF 파싱 중: {fname or '(이름 없음)'} "
+                    f"({len(pdf_bytes):,}B)"
                 )
                 pdf_txs = parse_pdf_transactions(pdf_bytes, "", s_year, s_month)
                 if not pdf_txs and BC_PDF_PASSWORD:
@@ -1493,12 +1501,6 @@ def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
                     pdf_txs = parse_pdf_transactions(pdf_bytes, BC_PDF_PASSWORD, s_year, s_month)
 
                 if pdf_txs:
-                    # IBK 발신은 원문에만 표시 — BC카드 본사 발신과 동일 거래라
-                    # 출처는 'BC카드'로 통일해 카드 청구 매칭 등에서 함께 묶임
-                    if is_ibk:
-                        for tx in pdf_txs:
-                            existing = tx.get("원문", "")
-                            tx["원문"] = (existing + " | IBK발신")[:100]
                     transactions.extend(pdf_txs)
                     print(f"    → {len(pdf_txs)}건 추출 ({s_year}-{s_month:02d} 명세)")
                     if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
@@ -1575,6 +1577,39 @@ def save_to_sheets(transactions: list):
         print("중복 없음, 새 거래 없음")
 
 
+def build_cleanup_summary(cleanup_log: dict, total_moved: dict) -> str:
+    """이메일 정리 결과를 사람이 읽기 좋은 요약 텍스트로.
+
+    카테고리별 처리 건수 + 대표 제목 몇 개를 보여준다.
+    홍보(광고) 메일은 읽음 처리되어 정리됨을 명시.
+    """
+    icons = {"쇼핑": "🛒", "SNS": "📱", "뉴스레터": "📰", "광고": "📢"}
+    lines = ["", "─" * 40, "📬 이메일 정리 요약"]
+    any_cleaned = False
+    for cat in ("광고", "쇼핑", "SNS", "뉴스레터"):
+        subjects = cleanup_log.get(cat, [])
+        n = total_moved.get(cat, 0)
+        if not n:
+            continue
+        any_cleaned = True
+        icon = icons.get(cat, "•")
+        read_note = " (읽음 처리)" if cat == "광고" else ""
+        lines.append(f"{icon} {cat}: {n}건{read_note}")
+        for subj in subjects[:3]:
+            lines.append(f"    - {subj}")
+        if len(subjects) > 3:
+            lines.append(f"    ... 외 {len(subjects) - 3}건")
+    if not any_cleaned:
+        lines.append("정리할 비거래 메일 없음")
+    # 거래/명세서 처리 요약
+    tx_moved = total_moved.get("거래", 0)
+    stmt = total_moved.get("명세서", 0) + total_moved.get("KB명세서", 0)
+    if tx_moved or stmt:
+        lines.append(f"💳 거래 알림 {tx_moved}건 + 명세서 {stmt}건 → 처리완료 폴더")
+    lines.append("─" * 40)
+    return "\n".join(lines)
+
+
 # ── 메인 ──────────────────────────────────────────────
 def main():
     print(f"[{datetime.now()}] 이메일 파싱 시작 (cleanup={'on' if ENABLE_EMAIL_CLEANUP else 'off'})...")
@@ -1584,10 +1619,13 @@ def main():
 
     all_transactions = []
     total_moved = {"거래": 0, "쇼핑": 0, "SNS": 0, "뉴스레터": 0, "광고": 0}
+    cleanup_log = {}  # {카테고리: [제목,...]} — 정리 요약용
 
     for folder in IMAP_FOLDERS:
         try:
-            transactions, moved = process_folder(mail, folder, LOOKBACK_HOURS, dest_folders)
+            transactions, moved = process_folder(
+                mail, folder, LOOKBACK_HOURS, dest_folders, cleanup_log
+            )
             all_transactions.extend(transactions)
             for k, v in moved.items():
                 total_moved[k] = total_moved.get(k, 0) + v
@@ -1617,6 +1655,7 @@ def main():
     if ENABLE_EMAIL_CLEANUP:
         moved_summary = ", ".join(f"{k} {v}" for k, v in total_moved.items() if v)
         print(f"이동된 메일: {moved_summary or '없음'}")
+        print(build_cleanup_summary(cleanup_log, total_moved))
 
     try:
         mail.logout()
