@@ -114,3 +114,16 @@ def test_is_statement_email_handles_kb_subject():
     assert email_parser.is_statement_email("BC카드 이용대금명세서")
     # 일반 결제 알림은 False
     assert not email_parser.is_statement_email("[KB국민카드] 결제 안내")
+
+
+def test_is_statement_email_kb_resend_and_excludes_setup():
+    """KB '명세서 재발송'(실제 KB 형식)은 명세서로, '수령방법' 안내는 제외."""
+    assert email_parser.is_statement_email(
+        "(KB국민카드) 임*재님 2026년 06월 명세서 재발송"
+    )
+    assert email_parser.is_statement_email(
+        "(KB국민카드) 임*재님 2026년 05월 명세서 재발송"
+    )
+    assert not email_parser.is_statement_email(
+        "(KB국민카드) 임*재님! KB국민카드 명세서 수령방법이 이메일로 신청완료!"
+    )

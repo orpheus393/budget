@@ -349,12 +349,17 @@ def classify_non_transaction(sender: str, subject: str) -> str | None:
 
 # ── BC카드 월간 명세서 PDF 파싱 ────────────────────────
 def is_statement_email(subject: str) -> bool:
+    # 명세서 안내 / 수령방법 변경 안내성 메일은 제외
+    if any(x in subject for x in ("수령방법", "신청완료", "이메일로 신청", "안내드립니다")):
+        return False
     return (
         "이용대금명세서" in subject
         or "이용대금 명세서" in subject
         or "이메일명세서" in subject
         or "e-메일명세서" in subject
         or "이용대금" in subject
+        or "명세서 재발송" in subject
+        or "명세서가 도착" in subject
     )
 
 
@@ -1318,8 +1323,9 @@ def prepare_dest_folders(mail) -> dict:
 def process_kb_statements(mail, folders: list, dest_folders: dict) -> tuple:
     """KB국민카드 이메일 명세서 HTML 처리. (transactions, moved_count) 반환.
 
-    KB는 PDF가 아닌 HTML 본문에 거래를 임베드. BC카드 명세서 패스와
-    별개로 KB 메일을 검색해 본문 HTML을 parse_kb_email_html()에 넘긴다.
+    KB 명세서는 본문 HTML에 거래가 임베드되거나, '명세서 재발송' 메일의
+    경우 본문은 안내문일 뿐이고 거래는 첨부 HTML(.html)에 들어있다.
+    두 곳을 순서대로 시도한다.
     """
     transactions = []
     moved_count = 0
@@ -1349,33 +1355,52 @@ def process_kb_statements(mail, folders: list, dest_folders: dict) -> tuple:
             if not is_statement_email(subject):
                 continue
 
-            # KB는 본문 HTML 안에 거래 임베드 — get_email_body는 plain 우선이라
-            # html 원문이 필요. 직접 추출.
-            html_body = ""
+            # 본문 HTML과 .html 첨부 둘 다 수집
+            html_candidates = []  # [(label, html_text)]
             for part in msg.walk():
-                if part.get_content_type() != "text/html":
-                    continue
+                ctype = part.get_content_type()
                 disp = (part.get("Content-Disposition") or "").lower()
-                if "attachment" in disp:
-                    continue
-                try:
-                    payload = part.get_payload(decode=True)
-                    if payload is None:
-                        continue
-                    cs = part.get_content_charset() or "cp949"
-                    html_body = payload.decode(cs, errors="replace")
-                    break
-                except Exception:
-                    continue
-            if not html_body:
-                print(f"  · KB 명세서 HTML 본문 없음: {subject[:60]}")
+                fn = decode_str(part.get_filename() or "")
+                is_attachment = "attachment" in disp or bool(fn)
+                # 본문 text/html
+                if ctype == "text/html" and not is_attachment:
+                    try:
+                        payload = part.get_payload(decode=True) or b""
+                        cs = part.get_content_charset() or "cp949"
+                        html_candidates.append(("body", payload.decode(cs, errors="replace")))
+                    except Exception:
+                        pass
+                # 첨부 .html (KB 재발송 메일은 거래가 여기에)
+                elif is_attachment and (ctype == "text/html" or fn.lower().endswith(".html") or fn.lower().endswith(".htm")):
+                    try:
+                        payload = part.get_payload(decode=True) or b""
+                        # 첨부는 charset 헤더가 없으므로 cp949 우선 시도
+                        for enc in ("cp949", "utf-8", "euc-kr"):
+                            try:
+                                html_candidates.append((f"attach:{fn or '?'}", payload.decode(enc)))
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                    except Exception:
+                        pass
+
+            if not html_candidates:
+                print(f"  · KB 명세서 HTML 없음 (본문·첨부): {subject[:60]}")
                 continue
 
-            print(f"  · KB 명세서 HTML 파싱 중: {subject[:60]}")
-            kb_txs = parse_kb_email_html(html_body)
+            print(f"  · KB 명세서 후보 {len(html_candidates)}개: {subject[:60]}")
+            kb_txs = []
+            chosen_label = None
+            for label, html_text in html_candidates:
+                txs = parse_kb_email_html(html_text)
+                if txs:
+                    kb_txs = txs
+                    chosen_label = label
+                    break
+
             if kb_txs:
                 transactions.extend(kb_txs)
-                print(f"    → {len(kb_txs)}건 추출")
+                print(f"    → {len(kb_txs)}건 추출 (소스: {chosen_label})")
                 if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
                     if move_email(mail, eid, dest_folders["처리완료"]):
                         moved_count += 1
