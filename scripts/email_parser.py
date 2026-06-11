@@ -1417,60 +1417,95 @@ def process_kb_statements(mail, folders: list, dest_folders: dict) -> tuple:
 
 
 def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
-    """BC카드 월간 명세서 PDF 처리. (transactions, moved_count) 반환."""
+    """BC카드 / IBK BC카드 월간 명세서 PDF 처리. (transactions, moved_count) 반환.
+
+    BC카드 본사 발신: bccard.com (보통 PDF 비밀번호 있음 → BC_PDF_PASSWORD 필요)
+    IBK BC카드 발신: ibk.co.kr (보통 비암호 PDF)
+    두 발신자 모두 동일한 BC카드 명세서 PDF 형식 사용.
+    """
     transactions = []
     moved_count = 0
-    if not BC_PDF_PASSWORD:
-        return transactions, moved_count
 
     since = (datetime.now() - timedelta(days=STATEMENT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+    # 두 발신자 도메인 모두 검색. IBK는 일반 거래 알림도 있으므로
+    # is_statement_email + PDF 첨부 유무로 명세서만 추려낸다.
+    sender_filters = ["bccard.com", "ibk.co.kr"]
+    seen_eids = set()  # 폴더×eid 중복 처리 방지
 
     for folder in folders:
         try:
             status, _ = mail.select(f'"{folder}"', readonly=False)
             if status != "OK":
                 continue
-            _, data = mail.search(None, f'(SINCE "{since}" FROM "bccard.com")')
-            eids = data[0].split() if data and data[0] else []
         except Exception as exc:
-            print(f"명세서 검색 실패 ({folder}): {exc}")
+            print(f"명세서 폴더 선택 실패 ({folder}): {exc}")
             continue
 
-        for eid in eids:
+        for sf in sender_filters:
             try:
-                _, msg_data = mail.fetch(eid, "(RFC822)")
-                msg = email.message_from_bytes(msg_data[0][1])
-                subject = decode_str(msg.get("Subject", ""))
-                date_str = msg.get("Date", "")
+                _, data = mail.search(None, f'(SINCE "{since}" FROM "{sf}")')
+                eids = data[0].split() if data and data[0] else []
             except Exception as exc:
-                print(f"명세서 FETCH 실패 (eid={eid}): {exc}")
+                print(f"명세서 검색 실패 ({folder}/{sf}): {exc}")
                 continue
 
-            if not is_statement_email(subject):
-                continue
+            for eid in eids:
+                key = (folder, eid)
+                if key in seen_eids:
+                    continue
+                seen_eids.add(key)
+                try:
+                    _, msg_data = mail.fetch(eid, "(RFC822)")
+                    msg = email.message_from_bytes(msg_data[0][1])
+                    subject = decode_str(msg.get("Subject", ""))
+                    sender = decode_str(msg.get("From", ""))
+                    date_str = msg.get("Date", "")
+                except Exception as exc:
+                    print(f"명세서 FETCH 실패 (eid={eid}): {exc}")
+                    continue
 
-            try:
-                dt = parsedate_to_datetime(date_str)
-                s_year, s_month = dt.year, dt.month
-            except Exception:
-                now = datetime.now()
-                s_year, s_month = now.year, now.month
+                if not is_statement_email(subject):
+                    continue
 
-            fname, pdf_bytes = get_pdf_attachment(msg)
-            if not pdf_bytes:
-                print(f"  · 명세서 첨부 없음: {subject[:60]}")
-                continue
+                try:
+                    dt = parsedate_to_datetime(date_str)
+                    s_year, s_month = dt.year, dt.month
+                except Exception:
+                    now = datetime.now()
+                    s_year, s_month = now.year, now.month
 
-            print(f"  · 명세서 PDF 파싱 중: {fname or '(이름 없음)'} (size={len(pdf_bytes)}B)")
-            pdf_txs = parse_pdf_transactions(pdf_bytes, BC_PDF_PASSWORD, s_year, s_month)
-            if pdf_txs:
-                transactions.extend(pdf_txs)
-                print(f"    → {len(pdf_txs)}건 추출 ({s_year}-{s_month:02d} 명세)")
-                if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
-                    if move_email(mail, eid, dest_folders["처리완료"]):
-                        moved_count += 1
-            else:
-                print(f"    → 추출 0건. PDF 포맷/비번 확인 필요")
+                fname, pdf_bytes = get_pdf_attachment(msg)
+                if not pdf_bytes:
+                    print(f"  · 명세서 첨부 없음: {subject[:60]}")
+                    continue
+
+                # IBK BC카드는 비암호 PDF, BC카드 본사는 비번 필요.
+                # 일단 비번 없이 시도, 실패하면 BC_PDF_PASSWORD로 재시도.
+                is_ibk = "ibk" in sender.lower()
+                source_label = "BC카드"  # 둘 다 BC카드 거래
+                print(
+                    f"  · 명세서 PDF 파싱 중: {fname or '(이름 없음)'} "
+                    f"({len(pdf_bytes):,}B, 발신:{'IBK' if is_ibk else 'BC'})"
+                )
+                pdf_txs = parse_pdf_transactions(pdf_bytes, "", s_year, s_month)
+                if not pdf_txs and BC_PDF_PASSWORD:
+                    print("    [재시도] BC_PDF_PASSWORD로 복호화")
+                    pdf_txs = parse_pdf_transactions(pdf_bytes, BC_PDF_PASSWORD, s_year, s_month)
+
+                if pdf_txs:
+                    # IBK 발신은 원문에만 표시 — BC카드 본사 발신과 동일 거래라
+                    # 출처는 'BC카드'로 통일해 카드 청구 매칭 등에서 함께 묶임
+                    if is_ibk:
+                        for tx in pdf_txs:
+                            existing = tx.get("원문", "")
+                            tx["원문"] = (existing + " | IBK발신")[:100]
+                    transactions.extend(pdf_txs)
+                    print(f"    → {len(pdf_txs)}건 추출 ({s_year}-{s_month:02d} 명세)")
+                    if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
+                        if move_email(mail, eid, dest_folders["처리완료"]):
+                            moved_count += 1
+                else:
+                    print("    → 추출 0건. PDF 포맷/비번 확인 필요")
 
         if ENABLE_EMAIL_CLEANUP:
             try:
@@ -1559,16 +1594,16 @@ def main():
         except Exception as exc:
             print(f"폴더 처리 실패 ({folder}): {exc}")
 
-    # BC카드 월간 명세서 PDF 별도 패스 (LOOKBACK_DAYS 윈도우)
-    if BC_PDF_PASSWORD:
-        try:
-            stmt_txs, stmt_moved = process_statements(mail, IMAP_FOLDERS, dest_folders)
-            all_transactions.extend(stmt_txs)
-            total_moved["명세서"] = stmt_moved
-        except Exception as exc:
-            print(f"명세서 처리 실패: {exc}")
-    else:
-        print("ℹ️  BC_PDF_PASSWORD 미설정: 월간 명세서 PDF 파싱 건너뜀")
+    # BC카드 / IBK BC카드 월간 명세서 PDF 별도 패스 (LOOKBACK_DAYS 윈도우)
+    # IBK BC카드는 비암호 PDF라 BC_PDF_PASSWORD 없어도 처리 가능 — 항상 시도
+    try:
+        stmt_txs, stmt_moved = process_statements(mail, IMAP_FOLDERS, dest_folders)
+        all_transactions.extend(stmt_txs)
+        total_moved["명세서"] = stmt_moved
+    except Exception as exc:
+        print(f"명세서 처리 실패: {exc}")
+    if not BC_PDF_PASSWORD:
+        print("ℹ️  BC_PDF_PASSWORD 미설정: BC카드 본사 암호 PDF는 건너뜀 (IBK BC카드 비암호 PDF는 처리)")
 
     # KB국민카드 이메일 명세서 HTML 별도 패스
     try:

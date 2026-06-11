@@ -59,13 +59,16 @@ repo → Settings → Secrets and variables → Actions:
 
 폴더는 자동 생성됩니다. 비활성화하려면 워크플로 yml에서 `ENABLE_EMAIL_CLEANUP`을 `"false"`로 바꾸세요.
 
-## BC카드 월간 명세서 PDF
-- BC카드/IBK기업은행은 실시간 알림 대신 월 1회 `이용대금명세서` PDF를 보냅니다.
-- `BC_PDF_PASSWORD` 시크릿(생년월일 6자리)을 설정하면 워크플로가 다음을 수행합니다:
-  - 최근 35일 내 `bccard.com` 발신 명세서 메일 검색
-  - PDF 첨부 복호화 → 표/텍스트에서 거래 추출
-  - Google Sheets `거래내역` 시트에 `BC카드` 출처로 추가 (중복은 자동 제외)
+## BC카드 / IBK BC카드 월간 명세서 PDF
+- BC카드 본사(`bccard.com`)와 IBK기업은행이 발급하는 BC카드(`ibk.co.kr` 발신)는 월 1회 `이용대금명세서` PDF를 보냅니다.
+- 워크플로가 매시간 두 발신자 도메인을 모두 검색해 다음을 수행합니다:
+  - 최근 35일 내 `bccard.com` 또는 `ibk.co.kr` 발신 명세서 메일 검색
+  - PDF 첨부 추출 → **비암호 PDF는 즉시 처리**, 암호 PDF는 `BC_PDF_PASSWORD`(생년월일 6자리) 시도
+  - 폰트 ToUnicode CMap이 깨진 PDF는 tesseract OCR(kor+eng) fallback 자동 적용
+  - 거래는 `BC카드(신용)` / `BC카드(체크)` 출처로 시트에 추가 (중복은 자동 제외)
+  - IBK 발신은 원문에 `IBK발신` 표시 (카드는 동일 BC카드라 출처는 통일)
   - 성공 시 `가계부_처리완료` 폴더로 이동, 실패 시 INBOX 유지하여 다음 실행에서 재시도
+- BC카드 본사 명세서는 보통 PDF 비밀번호가 걸려있어 `BC_PDF_PASSWORD` 시크릿 등록 필요. IBK BC카드 명세서는 비암호라 별도 설정 없이 작동.
 - BC카드 PDF 포맷이 바뀌면 첫 실행 후 워크플로 로그를 보고 정규식을 조정해야 할 수 있습니다.
 
 ## KB국민카드 이메일 명세서 (HTML)
