@@ -35,6 +35,10 @@ def _install_mocks():
     st.cache_data.return_value = lambda f: f  # @st.cache_data(ttl=...) → identity
     st.columns = lambda *a, **kw: [MagicMock() for _ in range(a[0] if a and isinstance(a[0], int) else len(a[0] if a else [1]))]
     st.tabs = lambda labels: [MagicMock() for _ in labels]
+    # st.button / st.form_submit_button은 명시적으로 False 반환 — 모듈 import 시
+    # 핸들러 내부가 실행되며 mock 객체가 정규식 등에 흘러가 collection 실패하는 것 방지.
+    st.button = lambda *a, **kw: False
+    st.form_submit_button = lambda *a, **kw: False
     sys.modules["streamlit"] = st
 
     # gspread + google.oauth2 — load_data 내부 try/except가 잡아주므로 raise 통과
