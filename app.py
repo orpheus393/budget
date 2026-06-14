@@ -1065,6 +1065,77 @@ def load_loan_records() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def build_notification_text(df_src, year: int, month: int) -> str:
+    """이번달 가계부 요약 + 예산 초과 + 이상치 텍스트.
+
+    슬랙 메시지 형식 (markdown subset). df_src·budget·outliers를 한 번에 종합.
+    """
+    inc, exp, bal, sal, fix, var = _month_pnl(df_src, year, month)
+    snap = _net_worth_snapshot(df_src, year, month) if df_src is not None and not df_src.empty else {}
+
+    lines = [f"*💰 {year}년 {month:02d}월 가계부 알림*"]
+    lines.append(f"• 수입 {inc:,} · 지출 {exp:,} · 손익 *{bal:+,}*원")
+    if sal > 0:
+        rate = (sal - exp) / sal * 100
+        lines.append(f"• 저축률 {rate:.1f}% (월급 {sal:,})")
+    if exp > 0:
+        lines.append(f"• 고정비 {fix:,} ({fix/exp*100:.0f}%) · 변동비 {var:,} ({var/exp*100:.0f}%)")
+    if snap.get("kakao") is not None:
+        lines.append(f"• 카뱅 마통 잔액 {snap['kakao']:+,}원")
+    if snap.get("net_worth") is not None:
+        lines.append(f"• 순자산 *{snap['net_worth']:+,}원*")
+
+    # 예산 초과
+    try:
+        budget = load_budget()
+    except Exception:
+        budget = {}
+    if budget and df_src is not None and not df_src.empty:
+        month_exp = df_src[
+            (df_src["날짜"].dt.year == year) & (df_src["날짜"].dt.month == month)
+            & (df_src["유형"] == "출금") & ~df_src["카테고리"].isin(NON_PNL_CATEGORIES)
+        ]
+        actuals = month_exp.groupby("카테고리")["금액"].sum().to_dict()
+        over = []
+        for cat, limit in budget.items():
+            actual = int(actuals.get(cat, 0))
+            if actual > limit:
+                over.append((cat, actual, limit))
+        if over:
+            lines.append(f"\n⚠️ *예산 초과 {len(over)}개*")
+            for cat, a, l in sorted(over, key=lambda x: -(x[1] - x[2]))[:5]:
+                lines.append(f"  • {cat}: {a:,} / 예산 {l:,} (+{a-l:,})")
+
+    # 이상치 (상위 3건만)
+    try:
+        outl = detect_outliers(df_src, year, month, threshold_ratio=3.0)
+    except Exception:
+        outl = pd.DataFrame()
+    if not outl.empty:
+        lines.append(f"\n⚠️ *이상치 {len(outl)}건*")
+        for _, r in outl.head(3).iterrows():
+            lines.append(f"  • {r['날짜']} {r['내역']}: {r['금액']:,}원 ({r['배수']}배)")
+
+    return "\n".join(lines)
+
+
+def send_slack_notification(text: str, webhook_url: str = "") -> bool:
+    """슬랙 incoming webhook으로 메시지 전송. 성공 시 True.
+
+    webhook_url 미지정 시 st.secrets["SLACK_WEBHOOK_URL"] 사용.
+    """
+    import requests
+
+    url = webhook_url or st.secrets.get("SLACK_WEBHOOK_URL", "")
+    if not url:
+        return False
+    try:
+        r = requests.post(url, json={"text": text}, timeout=10)
+        return bool(r.ok)
+    except Exception:
+        return False
+
+
 def detect_outliers(
     df_src, year: int, month: int, threshold_ratio: float = 3.0,
     min_history: int = 5,
@@ -1459,6 +1530,27 @@ if st.sidebar.button(
         except Exception as e:
             st.sidebar.error(f"점검 오류: {e}")
 
+if st.sidebar.button(
+    "📨 슬랙으로 요약 전송",
+    help=(
+        "이번달 손익·예산 초과·이상치를 슬랙 webhook으로 전송. "
+        "secrets에 SLACK_WEBHOOK_URL 설정 필요."
+    ),
+):
+    if not st.secrets.get("SLACK_WEBHOOK_URL"):
+        st.sidebar.error("SLACK_WEBHOOK_URL이 secrets에 없습니다")
+    else:
+        with st.spinner("전송 중..."):
+            try:
+                txt = build_notification_text(df_all, year, month)
+                ok = send_slack_notification(txt)
+                if ok:
+                    st.sidebar.success("✅ 슬랙 전송 완료")
+                else:
+                    st.sidebar.error("전송 실패 — webhook 응답 확인")
+            except Exception as e:
+                st.sidebar.error(f"전송 오류: {e}")
+
 st.sidebar.markdown("---")
 
 # 어머니 차입금 누적 (전체 기간)
@@ -1626,6 +1718,108 @@ def forecast_cash_flow(
             "예상카뱅잔액": int(cur_kk + cum_pnl) if cur_kk is not None else None,
         })
     return pd.DataFrame(rows)
+
+
+def generate_annual_report(df_src, year: int) -> str:
+    """주어진 연도의 종합 결산을 markdown 텍스트로 생성.
+
+    포함: 손익 요약·근로소득·고정비/변동비·카테고리 TOP·월별 추이·
+    어머니 부채 변동·카드 사용 합계·기말 잔액·저축률.
+    """
+    if df_src is None or df_src.empty:
+        return f"# {year}년 가계부 결산\n\n데이터가 없습니다."
+    df_y = df_src[df_src["날짜"].dt.year == year].copy()
+    if df_y.empty:
+        return f"# {year}년 가계부 결산\n\n{year}년 거래 내역이 없습니다."
+
+    pnl = df_y[~df_y["카테고리"].isin(NON_PNL_CATEGORIES)]
+    income = int(pnl[pnl["유형"] == "입금"]["금액"].sum())
+    expense = int(pnl[pnl["유형"] == "출금"]["금액"].sum())
+    balance = income - expense
+    salary = int(df_y[df_y["카테고리"] == "근로소득"]["금액"].sum())
+    fixed = int(pnl[(pnl["유형"] == "출금") & pnl["카테고리"].isin(FIXED_CATEGORIES)]["금액"].sum())
+    variable = expense - fixed
+    months = df_y["날짜"].dt.month.nunique()
+    savings_rate = (salary - expense) / salary * 100 if salary > 0 else 0
+
+    # 어머니 부채 / 카드 사용
+    mom = df_y[df_y["카테고리"] == "어머니차입금"]
+    mom_borrow = int(mom[mom["유형"] == "입금"]["금액"].sum())
+    mom_repay = int(mom[mom["유형"] == "출금"]["금액"].sum())
+    card_use = int(df_y[
+        df_y["출처"].isin(CARD_SOURCES) & (df_y["유형"] == "출금")
+        & ~df_y["카테고리"].isin(NON_PNL_CATEGORIES)
+    ]["금액"].sum())
+
+    # 기말 잔액 (연말 마지막 거래)
+    kk_year = df_y[(df_y["출처"] == "카카오뱅크") & df_y["잔액"].notna()] \
+        if "잔액" in df_y.columns else pd.DataFrame()
+    ibk_year = df_y[(df_y["출처"] == "IBK기업은행") & df_y["잔액"].notna()] \
+        if "잔액" in df_y.columns else pd.DataFrame()
+    end_kk = int(kk_year.sort_values("날짜").iloc[-1]["잔액"]) if not kk_year.empty else None
+    end_ibk = int(ibk_year.sort_values("날짜").iloc[-1]["잔액"]) if not ibk_year.empty else None
+
+    # 카테고리 TOP 10 (출금)
+    top = (pnl[pnl["유형"] == "출금"].groupby("카테고리")["금액"]
+           .sum().sort_values(ascending=False).head(10))
+    # 가맹점 TOP 10
+    top_merch = (pnl[pnl["유형"] == "출금"]
+                 .groupby("내역")["금액"].agg(["count", "sum"])
+                 .sort_values("sum", ascending=False).head(10))
+    # 월별 손익
+    df_y["월"] = df_y["날짜"].dt.month
+    monthly = pnl.groupby([df_y.loc[pnl.index, "월"], "유형"])["금액"].sum().unstack(fill_value=0)
+    if "입금" not in monthly.columns:
+        monthly["입금"] = 0
+    if "출금" not in monthly.columns:
+        monthly["출금"] = 0
+    monthly["손익"] = monthly["입금"] - monthly["출금"]
+
+    L = []
+    L.append(f"# {year}년 가계부 결산")
+    L.append(f"\n_생성일: {datetime.now().strftime('%Y-%m-%d %H:%M')} · 데이터 {months}개월_\n")
+    L.append("## 1. 손익 요약")
+    L.append(f"- 💼 근로소득: **{salary:,}원** ({salary//max(months,1):,}원/월)")
+    L.append(f"- 💚 총 수입: **{income:,}원**")
+    L.append(f"- ❤️ 총 지출: **{expense:,}원**")
+    L.append(f"- 💙 순손익: **{balance:+,}원** ({balance//max(months,1):+,}원/월)")
+    L.append(f"- 💰 저축률: **{savings_rate:.1f}%**")
+    L.append("")
+    L.append("## 2. 고정비 vs 변동비")
+    L.append(f"- 🧱 고정비: {fixed:,}원 ({fixed/expense*100 if expense else 0:.1f}%)")
+    L.append(f"- 🍴 변동비: {variable:,}원 ({variable/expense*100 if expense else 0:.1f}%)")
+    L.append("")
+    L.append("## 3. 카테고리별 지출 TOP 10")
+    L.append("| 카테고리 | 합계 | 비율 |")
+    L.append("|---|--:|--:|")
+    for cat, amt in top.items():
+        L.append(f"| {cat} | {int(amt):,}원 | {amt/expense*100 if expense else 0:.1f}% |")
+    L.append("")
+    L.append("## 4. 가맹점 TOP 10")
+    L.append("| 가맹점 | 건수 | 합계 |")
+    L.append("|---|--:|--:|")
+    for merch, row in top_merch.iterrows():
+        L.append(f"| {merch} | {int(row['count'])} | {int(row['sum']):,}원 |")
+    L.append("")
+    L.append("## 5. 월별 손익")
+    L.append("| 월 | 수입 | 지출 | 손익 |")
+    L.append("|---|--:|--:|--:|")
+    for m in sorted(monthly.index):
+        r = monthly.loc[m]
+        L.append(f"| {int(m)}월 | {int(r['입금']):,} | {int(r['출금']):,} | {int(r['손익']):+,} |")
+    L.append("")
+    L.append("## 6. 부채·자기자금 이동")
+    L.append(f"- 🏠 어머니 차입: 빌림 {mom_borrow:,} / 갚음 {mom_repay:,} → **순 {mom_borrow-mom_repay:+,}원**")
+    L.append(f"- 💳 카드 사용 합계: {card_use:,}원")
+    L.append("")
+    L.append("## 7. 기말 잔액")
+    if end_ibk is not None:
+        L.append(f"- IBK 기업은행: **{end_ibk:+,}원**")
+    if end_kk is not None:
+        L.append(f"- 카카오뱅크 (마통): **{end_kk:+,}원**")
+    if end_ibk is None and end_kk is None:
+        L.append("- 잔액 데이터 없음 (시트의 '잔액' 컬럼 채우려면 데이터 재업로드 필요)")
+    return "\n".join(L)
 
 
 # 손익(P&L) 정제: 자기자금 이동·부채 변동은 손익에서 제외
@@ -2209,6 +2403,23 @@ if not df.empty:
                 )
                 st.plotly_chart(fig_trend, use_container_width=True)
                 st.caption("카테고리별 월별 지출 추이 — 손익 포함분만")
+
+    # ── 📑 연간 결산 보고서 ──────────────────────────
+    with st.expander("📑 연간 결산 보고서 (다운로드 가능)"):
+        if not df_all.empty:
+            year_options = sorted(df_all["날짜"].dt.year.unique(), reverse=True)
+            if year_options:
+                sel_year = st.selectbox(
+                    "결산 연도", year_options, key="annual_year",
+                )
+                report_md = generate_annual_report(df_all, int(sel_year))
+                st.markdown(report_md)
+                st.download_button(
+                    "📥 markdown 다운로드",
+                    report_md,
+                    file_name=f"budget-report-{sel_year}.md",
+                    mime="text/markdown",
+                )
 
     # ── 거래 내역 테이블 ──────────────────────────────
     st.subheader("📋 거래 내역")
