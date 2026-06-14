@@ -968,6 +968,103 @@ def save_budget(budget_dict: dict) -> int:
     return len(rows) - 1
 
 
+# ── 🏠 주택금융공사 보금자리론 회차 추적 ─────────────
+LOAN_SHEET_NAME = "보금자리론"
+LOAN_SHEET_HEADER = ["납입일", "회차", "납입액", "원금", "이자", "잔액", "원본"]
+
+
+def get_loan_worksheet():
+    """보금자리론 워크시트 가져오기/생성."""
+    ws_main = get_worksheet()
+    sheet = ws_main.spreadsheet
+    try:
+        return sheet.worksheet(LOAN_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(LOAN_SHEET_NAME, rows=240, cols=8)
+        ws.append_row(LOAN_SHEET_HEADER)
+        return ws
+
+
+def parse_loan_notice(text: str, base_year: int | None = None) -> dict | None:
+    """주택금융공사 보금자리론 안내 문자에서 회차/원리금/잔액 추출.
+
+    예: "06월 18일은 ... 116회차 ... 대출잔액 114,051,749원
+         ... 총:729,960원(원금:465,517 이자:264,443) ..."
+    """
+    if not text:
+        return None
+    out = {}
+    # 납입일: "06월 18일" — 안내 시점 기준 가까운 같은 해
+    m_date = re.search(r"(\d{1,2})월\s*(\d{1,2})일", text)
+    if m_date:
+        year = base_year or datetime.now().year
+        out["납입일"] = f"{year:04d}-{int(m_date.group(1)):02d}-{int(m_date.group(2)):02d}"
+    # 회차
+    m_n = re.search(r"(\d+)\s*회차", text)
+    if m_n:
+        out["회차"] = int(m_n.group(1))
+    # 대출 잔액
+    m_bal = re.search(r"대출잔액\s*([\d,]+)\s*원", text)
+    if m_bal:
+        out["잔액"] = int(m_bal.group(1).replace(",", ""))
+    # 납입 총액 + 원금 + 이자
+    m_pay = re.search(
+        r"총\s*:?\s*([\d,]+)\s*원\s*\(\s*원금\s*:?\s*([\d,]+)\s*이자\s*:?\s*([\d,]+)",
+        text,
+    )
+    if m_pay:
+        out["납입액"] = int(m_pay.group(1).replace(",", ""))
+        out["원금"] = int(m_pay.group(2).replace(",", ""))
+        out["이자"] = int(m_pay.group(3).replace(",", ""))
+    required = ("납입일", "회차", "납입액", "원금", "이자", "잔액")
+    return out if all(k in out for k in required) else None
+
+
+def save_loan_record(parsed: dict, raw_text: str) -> str:
+    """회차 정보를 시트에 추가. Returns: 'added' / 'updated' / 'skipped'."""
+    ws = get_loan_worksheet()
+    rows = ws.get_all_values()
+    target_round = str(parsed["회차"])
+    for i, r in enumerate(rows[1:], start=2):
+        if len(r) >= 2 and r[1] == target_round:
+            # 회차 중복 — 기존 데이터와 같으면 skip, 다르면 갱신
+            existing = [r[0], int(r[1]), int(r[2]) if r[2] else 0,
+                        int(r[3]) if r[3] else 0, int(r[4]) if r[4] else 0,
+                        int(r[5]) if r[5] else 0]
+            new = [parsed["납입일"], parsed["회차"], parsed["납입액"],
+                   parsed["원금"], parsed["이자"], parsed["잔액"]]
+            if existing == new:
+                return "skipped"
+            ws.update(f"A{i}:G{i}", [[
+                parsed["납입일"], parsed["회차"], parsed["납입액"],
+                parsed["원금"], parsed["이자"], parsed["잔액"],
+                raw_text[:300],
+            ]], value_input_option="USER_ENTERED")
+            return "updated"
+    ws.append_row([
+        parsed["납입일"], parsed["회차"], parsed["납입액"],
+        parsed["원금"], parsed["이자"], parsed["잔액"], raw_text[:300],
+    ], value_input_option="USER_ENTERED")
+    return "added"
+
+
+@st.cache_data(ttl=300)
+def load_loan_records() -> pd.DataFrame:
+    """보금자리론 회차 기록 로드."""
+    try:
+        ws = get_loan_worksheet()
+        recs = ws.get_all_records()
+        if not recs:
+            return pd.DataFrame()
+        df = pd.DataFrame(recs)
+        df["납입일"] = pd.to_datetime(df["납입일"], errors="coerce")
+        for c in ("회차", "납입액", "원금", "이자", "잔액"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+        return df.dropna(subset=["납입일"]).sort_values("회차")
+    except Exception:
+        return pd.DataFrame()
+
+
 def detect_outliers(
     df_src, year: int, month: int, threshold_ratio: float = 3.0,
     min_history: int = 5,
@@ -1395,6 +1492,26 @@ if not df_all.empty and "잔액" in df_all.columns:
             help="마이너스(−)면 마통 사용 중. 0보다 작아질수록 부채 ↑",
         )
 
+# 🏠 보금자리론 잔액 (가장 최근 회차)
+try:
+    _loan_df = load_loan_records()
+except Exception:
+    _loan_df = pd.DataFrame()
+if not _loan_df.empty:
+    _last = _loan_df.iloc[-1]
+    st.sidebar.markdown("##### 🏠 보금자리론")
+    st.sidebar.metric(
+        label=f"{int(_last['회차'])}회차 잔액",
+        value=f"{int(_last['잔액']):,}원",
+        delta=f"-{int(_last['원금']):,}원 (원금 상환)",
+        delta_color="inverse",
+    )
+    _total_p = int(_loan_df["원금"].sum())
+    _total_i = int(_loan_df["이자"].sum())
+    st.sidebar.caption(
+        f"누적 원금 {_total_p:,}원 · 이자 {_total_i:,}원"
+    )
+
 st.sidebar.markdown("---")
 st.sidebar.caption("현대카드 내역은 수동 업로드 필요")
 
@@ -1790,6 +1907,60 @@ if not df_all.empty:
         )
 
 # ── 🏷️ 카테고리 수동 매핑 (앱에서 직접 편집) ──────────
+# ── 🏠 보금자리론 회차 paste 입력 ────────────────────
+with st.expander("🏠 보금자리론 회차 추가 (안내 문자 paste)"):
+    st.caption(
+        "주택금융공사가 보낸 보금자리론 원리금 안내 본문을 그대로 붙여넣으면 "
+        "회차·원금·이자·잔액을 자동으로 추출해 '보금자리론' 워크시트에 저장합니다. "
+        "같은 회차를 다시 paste하면 갱신됩니다."
+    )
+    _loan_text = st.text_area(
+        "안내 문자 본문",
+        height=160,
+        placeholder="예: 06월 18일은 ... 116회차 ... 대출잔액 114,051,749원 ... "
+                    "총:729,960원(원금:465,517 이자:264,443) ...",
+        key="loan_notice_input",
+    )
+    if st.button("📥 회차 저장", type="primary", key="loan_save"):
+        if not _loan_text.strip():
+            st.warning("본문을 붙여넣어주세요")
+        else:
+            parsed = parse_loan_notice(_loan_text)
+            if not parsed:
+                st.error(
+                    "파싱 실패 — '회차', '대출잔액', '총:..원(원금:.. 이자:..)' "
+                    "패턴이 모두 있는지 확인하세요"
+                )
+            else:
+                try:
+                    result = save_loan_record(parsed, _loan_text)
+                    msg = (
+                        f"✅ {parsed['회차']}회차 ({parsed['납입일']}) — "
+                        f"원금 {parsed['원금']:,} / 이자 {parsed['이자']:,} / "
+                        f"잔액 {parsed['잔액']:,}원"
+                    )
+                    if result == "added":
+                        st.success("✅ 새 회차 추가됨\n\n" + msg)
+                    elif result == "updated":
+                        st.success("🔁 기존 회차 갱신됨\n\n" + msg)
+                    else:
+                        st.info("이미 동일 데이터로 등록된 회차입니다\n\n" + msg)
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"저장 오류: {e}")
+    # 누적 회차 보기
+    _loan_history = load_loan_records()
+    if not _loan_history.empty:
+        st.markdown("##### 등록된 회차")
+        show = _loan_history[["납입일", "회차", "납입액", "원금", "이자", "잔액"]].copy()
+        show["납입일"] = show["납입일"].dt.strftime("%Y-%m-%d")
+        for c in ("납입액", "원금", "이자", "잔액"):
+            show[c] = show[c].apply(lambda x: f"{x:,}원")
+        st.dataframe(show.sort_values("회차", ascending=False),
+                     use_container_width=True, hide_index=True)
+
+
 with st.expander("🏷️ 카테고리 수동 매핑 (특정 가맹점 일괄 변경)"):
     st.caption(
         "내역을 정확히 입력하고 카테고리를 선택하면, 시트의 동일 내역 행 전체에 적용됩니다. "
