@@ -1518,6 +1518,156 @@ def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
     return transactions, moved_count
 
 
+# ── 주택금융공사 보금자리론 안내 메일 처리 ───────────
+def parse_hf_loan_notice(text: str, base_year: int | None = None) -> dict | None:
+    """주택금융공사 보금자리론 안내(SMS/이메일)에서 회차·원리금·잔액 추출.
+
+    예: '06월 18일은 ... 116회차 ... 대출잔액 114,051,749원
+         ... 총:729,960원(원금:465,517 이자:264,443) ...'
+    app.py의 parse_loan_notice와 동일한 정규식 — email cron에서
+    독립적으로 동작하기 위해 같은 로직을 복제한다.
+    """
+    if not text:
+        return None
+    out = {}
+    m_date = re.search(r"(\d{1,2})월\s*(\d{1,2})일", text)
+    if m_date:
+        year = base_year or datetime.now().year
+        out["납입일"] = f"{year:04d}-{int(m_date.group(1)):02d}-{int(m_date.group(2)):02d}"
+    m_n = re.search(r"(\d+)\s*회차", text)
+    if m_n:
+        out["회차"] = int(m_n.group(1))
+    m_bal = re.search(r"대출잔액\s*([\d,]+)\s*원", text)
+    if m_bal:
+        out["잔액"] = int(m_bal.group(1).replace(",", ""))
+    m_pay = re.search(
+        r"총\s*:?\s*([\d,]+)\s*원\s*\(\s*원금\s*:?\s*([\d,]+)\s*이자\s*:?\s*([\d,]+)",
+        text,
+    )
+    if m_pay:
+        out["납입액"] = int(m_pay.group(1).replace(",", ""))
+        out["원금"] = int(m_pay.group(2).replace(",", ""))
+        out["이자"] = int(m_pay.group(3).replace(",", ""))
+    required = ("납입일", "회차", "납입액", "원금", "이자", "잔액")
+    return out if all(k in out for k in required) else None
+
+
+def process_hf_loan_emails(mail, folders: list, dest_folders: dict) -> int:
+    """주택금융공사 안내 메일을 검색해 회차 정보를 '보금자리론' 워크시트에
+    자동 추가. 반환: 추가된 회차 수.
+
+    안내 본문(text 또는 HTML strip)에서 parse_hf_loan_notice로 추출.
+    중복 회차는 skip. ENABLE_EMAIL_CLEANUP=true면 처리완료 폴더로 이동.
+    """
+    if not (GOOGLE_SHEET_ID and GOOGLE_CREDS_JSON):
+        return 0
+    since = (datetime.now() - timedelta(days=STATEMENT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+    added = 0
+    # 보금자리론 워크시트 fetch는 첫 안내 발견 시 lazy하게
+    loan_ws = None
+    existing_rounds = set()
+
+    for folder in folders:
+        try:
+            status, _ = mail.select(f'"{folder}"', readonly=False)
+            if status != "OK":
+                continue
+            _, data = mail.search(None, f'(SINCE "{since}" FROM "hf.go.kr")')
+            eids = data[0].split() if data and data[0] else []
+        except Exception as exc:
+            print(f"주택금융공사 검색 실패 ({folder}): {exc}")
+            continue
+        if not eids:
+            continue
+        for eid in eids:
+            try:
+                _, msg_data = mail.fetch(eid, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_str(msg.get("Subject", ""))
+            except Exception as exc:
+                print(f"HF 메일 FETCH 실패 ({eid}): {exc}")
+                continue
+
+            plain, html = "", ""
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                if (part.get("Content-Disposition") or "").lower().count("attachment"):
+                    continue
+                try:
+                    payload = part.get_payload(decode=True) or b""
+                    cs = part.get_content_charset() or "utf-8"
+                    text = payload.decode(cs, errors="replace")
+                except Exception:
+                    continue
+                if ctype == "text/plain":
+                    plain += text + "\n"
+                elif ctype == "text/html":
+                    html += text + "\n"
+            body_text = plain or strip_html(html)
+            if not body_text:
+                continue
+            parsed = parse_hf_loan_notice(body_text)
+            if not parsed:
+                continue
+
+            # lazy load 보금자리론 워크시트
+            if loan_ws is None:
+                try:
+                    import json
+                    import tempfile
+                    import gspread
+                    from google.oauth2.service_account import Credentials
+                    creds_dict = json.loads(GOOGLE_CREDS_JSON)
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                        json.dump(creds_dict, f)
+                        creds_path = f.name
+                    scopes = [
+                        "https://spreadsheets.google.com/feeds",
+                        "https://www.googleapis.com/auth/drive",
+                    ]
+                    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+                    gc = gspread.authorize(creds)
+                    os.unlink(creds_path)
+                    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+                    try:
+                        loan_ws = sh.worksheet("보금자리론")
+                    except gspread.WorksheetNotFound:
+                        loan_ws = sh.add_worksheet("보금자리론", rows=240, cols=8)
+                        loan_ws.append_row(
+                            ["납입일", "회차", "납입액", "원금", "이자", "잔액", "원본"]
+                        )
+                    # 기존 회차 수집
+                    for r in loan_ws.get_all_values()[1:]:
+                        if len(r) >= 2 and r[1]:
+                            existing_rounds.add(r[1])
+                except Exception as exc:
+                    print(f"보금자리론 워크시트 접근 실패: {exc}")
+                    return added
+
+            if str(parsed["회차"]) in existing_rounds:
+                print(f"  · HF {parsed['회차']}회차 — 이미 등록됨, skip")
+                continue
+            loan_ws.append_row([
+                parsed["납입일"], parsed["회차"], parsed["납입액"],
+                parsed["원금"], parsed["이자"], parsed["잔액"],
+                body_text[:300],
+            ], value_input_option="USER_ENTERED")
+            existing_rounds.add(str(parsed["회차"]))
+            added += 1
+            print(f"  · HF {parsed['회차']}회차 자동 추가 (잔액 {parsed['잔액']:,})")
+
+            if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
+                move_email(mail, eid, dest_folders["처리완료"])
+
+        if ENABLE_EMAIL_CLEANUP:
+            try:
+                mail.expunge()
+            except Exception:
+                pass
+
+    return added
+
+
 # ── Google Sheets 저장 ────────────────────────────────
 def save_to_sheets(transactions: list):
     import json
@@ -1650,6 +1800,15 @@ def main():
         total_moved["KB명세서"] = kb_moved
     except Exception as exc:
         print(f"KB 명세서 처리 실패: {exc}")
+
+    # 주택금융공사 보금자리론 안내 — 회차 정보를 보금자리론 워크시트에 자동 누적
+    try:
+        hf_added = process_hf_loan_emails(mail, IMAP_FOLDERS, dest_folders)
+        if hf_added:
+            print(f"🏠 주택금융공사: {hf_added}개 회차 추가")
+            total_moved["보금자리론"] = hf_added
+    except Exception as exc:
+        print(f"주택금융공사 안내 처리 실패: {exc}")
 
     print(f"파싱된 거래: {len(all_transactions)}개")
     if ENABLE_EMAIL_CLEANUP:

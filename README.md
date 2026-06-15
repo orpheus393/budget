@@ -33,6 +33,8 @@ repo → Settings → Secrets and variables → Actions:
 - `GOOGLE_CREDS_JSON`: 서비스 계정 JSON 전체 내용
 - `BC_PDF_PASSWORD` (선택): BC카드 월간 명세서 PDF 비밀번호 (생년월일 6자리, 예: `900101`).
   설정하면 매월 도착하는 `이용대금명세서` PDF를 자동 복호화·파싱해서 시트에 추가합니다.
+- `SLACK_WEBHOOK_URL` (선택): 슬랙 알림 + **cron 실패 시 자동 슬랙 알림**.
+- `OWNER_NAME` (선택, 기본 `임영재`): 본인 명의 계좌 예금주명. 거래 내역의 '내역'에 이 이름이 있으면 농협→어머니차입금, 카뱅·토스→자기이체로 자동 분기. 다른 사용자가 쓸 때 자기 이름으로 변경.
 
 ### 4. Streamlit Cloud 배포
 1. https://streamlit.io/cloud 접속
