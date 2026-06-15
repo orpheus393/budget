@@ -44,3 +44,13 @@ jobs:
           LOOKBACK_HOURS: "2"
           STATEMENT_LOOKBACK_DAYS: "35"
         run: python scripts/email_parser.py
+
+      - name: 실패 시 슬랙 알림 (SLACK_WEBHOOK_URL 설정된 경우)
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\": \":x: *가계부 cron 실패* — workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$SLACK_WEBHOOK_URL" || true
+

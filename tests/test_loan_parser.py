@@ -1,6 +1,11 @@
 """주택금융공사 보금자리론 안내 파싱(parse_loan_notice) 회귀 테스트."""
 
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+
 import app
+import email_parser
 
 
 REAL_NOTICE = """\
@@ -54,3 +59,13 @@ def test_parse_loan_notice_handles_spaces_and_punct():
     assert out["원금"] == 470000
     assert out["이자"] == 260000
     assert out["잔액"] == 113500000
+
+
+def test_email_parser_hf_loan_notice_matches_app_parser():
+    """email_parser의 parse_hf_loan_notice가 app.parse_loan_notice와 동일 결과."""
+    text = REAL_NOTICE
+    a = app.parse_loan_notice(text, base_year=2026)
+    b = email_parser.parse_hf_loan_notice(text, base_year=2026)
+    assert a == b
+    assert b["회차"] == 116
+    assert b["원금"] + b["이자"] == b["납입액"]
