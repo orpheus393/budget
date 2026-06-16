@@ -61,6 +61,14 @@ repo → Settings → Secrets and variables → Actions:
 
 폴더는 자동 생성됩니다. 비활성화하려면 워크플로 yml에서 `ENABLE_EMAIL_CLEANUP`을 `"false"`로 바꾸세요.
 
+### 누적 메일 일회 정리 (Backfill)
+매시간 cron은 최근 2시간만 검색하므로 **이미 INBOX에 쌓여있던 과거 메일은 자동 정리 안 됨**.
+한 번에 정리하려면:
+1. GitHub → Actions → `가계부 이메일 자동 수집` → **Run workflow**
+2. `lookback_hours` 입력값에 **720** (= 30일) 또는 **8760** (= 1년) 입력
+3. Run → 30일/1년치 누적 메일이 한 번에 분류 폴더로 이동
+4. 이후엔 기본 2시간으로 자동 동작
+
 ## BC카드 / IBK BC카드 월간 명세서 PDF
 - BC카드 본사(`bccard.com`)와 IBK기업은행이 발급하는 BC카드(`ibk.co.kr` 발신)는 월 1회 `이용대금명세서` PDF를 보냅니다.
 - 워크플로가 매시간 두 발신자 도메인을 모두 검색해 다음을 수행합니다:
