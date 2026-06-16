@@ -164,9 +164,21 @@ def decode_str(s):
                 out += part.decode(cs, errors="replace")
             except (LookupError, UnicodeDecodeError):
                 out += part.decode("utf-8", errors="replace")
-        else:
+        elif isinstance(part, str):
             out += part
+        else:
+            # 일부 메일은 decode_header가 email.header.Header를 반환할 수 있음
+            out += str(part)
     return out
+
+
+def header_str(value) -> str:
+    """msg.get(...) 결과를 안전하게 str로. None/Header/str 모두 처리."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
 
 
 def strip_html(html: str) -> str:
@@ -195,7 +207,7 @@ def get_email_body(msg) -> str:
             if part.get_content_maintype() == "multipart":
                 continue
             content_type = part.get_content_type()
-            disposition = (part.get("Content-Disposition") or "").lower()
+            disposition = header_str(part.get("Content-Disposition")).lower()
             if "attachment" in disposition:
                 continue
             try:
@@ -1382,7 +1394,7 @@ def process_kb_statements(mail, folders: list, dest_folders: dict) -> tuple:
             html_candidates = []  # [(label, html_text)]
             for part in msg.walk():
                 ctype = part.get_content_type()
-                disp = (part.get("Content-Disposition") or "").lower()
+                disp = header_str(part.get("Content-Disposition")).lower()
                 fn = decode_str(part.get_filename() or "")
                 is_attachment = "attachment" in disp or bool(fn)
                 # 본문 text/html
@@ -1606,7 +1618,7 @@ def process_hf_loan_emails(mail, folders: list, dest_folders: dict) -> int:
             plain, html = "", ""
             for part in msg.walk():
                 ctype = part.get_content_type()
-                if (part.get("Content-Disposition") or "").lower().count("attachment"):
+                if header_str(part.get("Content-Disposition")).lower().count("attachment"):
                     continue
                 try:
                     payload = part.get_payload(decode=True) or b""
