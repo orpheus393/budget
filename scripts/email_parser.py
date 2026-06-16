@@ -61,12 +61,18 @@ IMAP_FOLDERS = [
 # ── 비거래 이메일 분류 규칙 ───────────────────────────
 NON_TX_CATEGORIES = [
     # (카테고리명, 폴더, sender 키워드, subject 키워드)
+    # subject 매칭은 classify_non_transaction에서 공백 제거 후 substring 검사
     ("쇼핑", SHOPPING_FOLDER,
      ["coupang.com", "11st.co.kr", "ssg.com", "gmarket", "auction.co.kr",
       "wemakeprice", "smartstore.naver.com", "ohou.se", "kurly.com",
-      "musinsa", "29cm"],
-     ["주문확인", "배송완료", "배송시작", "발송완료", "출고완료", "도착예정",
-      "배송지연", "반품접수", "교환접수", "구매확정"]),
+      "musinsa", "29cm",
+      "aliexpress.com", "amazon.com", "amazon.co.jp", "qoo10",
+      "tmall", "taobao", "shopee", "lotteon"],
+     ["주문확인", "주문완료", "주문건",
+      "배송완료", "배송시작", "배송중", "배송재개",
+      "발송완료", "출고완료", "도착예정", "도착",
+      "배송지연", "반품접수", "교환접수", "구매확정",
+      "운송장", "택배사", "송장번호"]),
     ("SNS", SNS_FOLDER,
      ["instagram.com", "facebookmail.com", "linkedin.com", "twitter.com",
       "x.com", "tiktok.com", "youtube.com", "discord.com", "slack.com",
@@ -335,14 +341,23 @@ def guess_category(merchant: str, tx_type: str) -> str:
 
 # ── 비거래 이메일 분류 ────────────────────────────────
 def classify_non_transaction(sender: str, subject: str) -> str | None:
-    """비거래 이메일을 카테고리 폴더로 분류. 매칭되는 폴더 이름 또는 None"""
+    """비거래 이메일을 카테고리 폴더로 분류. 매칭되는 폴더 이름 또는 None.
+
+    제목 매칭은 공백 무시 — '배송 완료' / '배송완료' / '배 송 완 료' 모두 매칭.
+    AliExpress 등 발신자가 제목 포맷팅을 다르게 쓰는 케이스 대응.
+    """
     sender_lower = sender.lower()
+    subject_lower = subject.lower()
+    # 공백 제거 버전 (제목 매칭 정확도 향상)
+    subject_nospace = re.sub(r"\s+", "", subject_lower)
     for category, folder, sender_kws, subject_kws in NON_TX_CATEGORIES:
         for kw in sender_kws:
             if kw.lower() in sender_lower:
                 return folder
         for kw in subject_kws:
-            if kw.lower() in subject.lower():
+            kw_lower = kw.lower()
+            # 원본 또는 공백 제거 버전에서 매칭
+            if kw_lower in subject_lower or re.sub(r"\s+", "", kw_lower) in subject_nospace:
                 return folder
     return None
 
