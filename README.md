@@ -3,7 +3,7 @@
 ## 구조
 ```
 GitHub Actions (매시간)
-    → 네이버 이메일 파싱 (IBK기업은행, BC카드, 카카오뱅크, 현대카드, KB카드(placeholder))
+    → 네이버 이메일 파싱 (IBK기업은행, BC카드, IBK BC카드, 카카오뱅크, 현대카드, KB국민카드)
     → Google Sheets 저장
           ↓
 Streamlit Cloud (대시보드)
@@ -154,6 +154,11 @@ pip install -r requirements-dev.txt
 python3 -m pytest tests/ -v
 ```
 
-`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 23개 테스트:
+`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 60개 테스트:
+- **test_analysis.py** (13개): _month_pnl·_net_worth_snapshot·detect_outliers·forecast_cash_flow·_normalize_korean_date·_delta·generate_annual_report·build_notification_text·send_slack_notification
 - **test_categorize.py** (14개): guess_category 분기·learn_category_overrides 학습 로직
-- **test_analysis.py** (9개): _month_pnl·_net_worth_snapshot·detect_outliers·forecast_cash_flow·_normalize_korean_date·_delta
+- **test_cleanup_summary.py** (5개): 이메일 정리 요약 (카테고리·제목·읽음 처리·길이 절단)
+- **test_email_classifier.py** (9개): 쇼핑/SNS/광고 분류, AliExpress·Amazon, 제목 공백 변형
+- **test_header_decoding.py** (4개): 이메일 Header 객체 안전 디코딩 (.lower() 크래시 방지)
+- **test_kb_parser.py** (9개): KB국민카드 HTML 명세서 파서 (할부 분담분 정합 포함)
+- **test_loan_parser.py** (6개): 보금자리론 안내 paste 회차 추출
