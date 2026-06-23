@@ -1046,12 +1046,19 @@ def _extract_pdf_hybrid(pdf_bytes: bytes, password: str,
             pass
 
 
-# 가맹점명이 깨진 인코딩인지 판정용 — Latin-1 supplement, 기호류 영역
+# 가맹점명이 깨진 인코딩인지 판정용 — Latin-1 supplement, 기호류 영역.
+# Korean PDF의 ToUnicode CMap 깨짐 시 흔히 나타나는 mojibake 문자 영역.
 _GARBLED_RANGES = (
-    (0x00A0, 0x00FF),  # Latin-1 supplement (mojibake에 흔히 등장)
+    (0x00A0, 0x00FF),  # Latin-1 supplement (¡«¬©Æ°÷ 등)
+    (0x0100, 0x017F),  # Latin Extended-A (Ÿı 등)
     (0x0250, 0x02AF),  # IPA Extensions
-    (0x02B0, 0x02FF),  # Spacing Modifier Letters
-    (0x2200, 0x22FF),  # Mathematical Operators
+    (0x02B0, 0x02FF),  # Spacing Modifier Letters (ˆ˝˜ 등)
+    (0x2030, 0x205F),  # General Punctuation (‰⁄… 등, 0x2018-201F 스마트인용부호 제외)
+    (0x2100, 0x214F),  # Letterlike Symbols
+    (0x2150, 0x218F),  # Number Forms
+    (0x2200, 0x22FF),  # Mathematical Operators (∂∞∫≠ 등)
+    (0x2300, 0x23FF),  # Miscellaneous Technical
+    (0x25A0, 0x25FF),  # Geometric Shapes (◊ 등)
     (0x2500, 0x257F),  # Box Drawing
 )
 

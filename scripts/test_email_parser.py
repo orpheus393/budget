@@ -312,6 +312,14 @@ assert_eq(_looks_garbled(mixed), True, "garbled detect: half garbled = garbled")
 one_bad = ["옥션", "스타벅스", "이마트", "¡«"]  # 1/4 = 25% but threshold max(2, 4//3=1) = 2 → not garbled
 assert_eq(_looks_garbled(one_bad), False, "garbled detect: 1/4 below threshold")
 
+# 새로 추가된 _GARBLED_RANGES (Latin Extended-A, 일반 구두점, 기하 도형) 검증
+ext_garbled = ["ıŸŸ≠ŸŸ", "Ó√ˆÍ", "⁄¿’¤Œ˙", "◊Ãˆ‰Ã"]  # ı(0131), Ÿ(0178), ⁄(2044), ◊(25CA), ‰(2030)
+assert_eq(_looks_garbled(ext_garbled), True, "garbled detect: latin-extended-a + general-punct")
+
+# 정상 한국어/영문 가맹점은 새 ranges에서도 false 유지
+clean_mixed = ["옥션", "동광석유 (주) 대야주유소", "물총칼국수군포점", "LG U+", "CJ CGV"]
+assert_eq(_looks_garbled(clean_mixed), False, "garbled detect: clean (with parentheses/plus) stays clean")
+
 # ── _clean_merchant_value: HTML 잔재 정리 ──
 assert_eq(_clean_merchant_value("스타벅스 강남점"), "스타벅스 강남점", "clean plain")
 assert_eq(_clean_merchant_value("스타벅스</td>"), "스타벅스", "clean </td>")
