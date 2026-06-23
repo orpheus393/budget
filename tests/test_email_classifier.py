@@ -80,3 +80,81 @@ def test_transaction_email_returns_none():
         "bcbill@bccard.com", "[BC카드] 결제 안내"
     )
     assert folder is None
+
+
+# ── PG사/구독/영수증/고지서 (카드 알림 외 결제·주문 확인 메일) ──
+def test_easypay_receipt_classified_as_shopping():
+    """이지페이 결제 확인 메일도 쇼핑 폴더로."""
+    folder = email_parser.classify_non_transaction(
+        "easypay_noreturn@easypay.co.kr",
+        "임*재님, 쿠팡(주)에서 [신용카드]결제하신 내역입니다.",
+    )
+    assert folder == email_parser.SHOPPING_FOLDER
+
+
+def test_kcp_payment_classified_as_shopping():
+    """NHN KCP 결제 내역 메일도 정리."""
+    folder = email_parser.classify_non_transaction(
+        "pgadmcust@kcp.co.kr",
+        "NHN KCP - 쿠팡(쿠페이)의 결제 내역입니다.",
+    )
+    assert folder == email_parser.SHOPPING_FOLDER
+
+
+def test_apartment_bill_classified_as_shopping():
+    """아파트아이 관리비 고지서."""
+    folder = email_parser.classify_non_transaction(
+        "aptibill@apti.co.kr",
+        "[아파트아이]아파트관리비 05월 고지서입니다.",
+    )
+    assert folder == email_parser.SHOPPING_FOLDER
+
+
+def test_apple_receipt_classified_as_shopping():
+    """Apple 영수증."""
+    folder = email_parser.classify_non_transaction(
+        "no_reply@email.apple.com",
+        "Apple에서 발행한 영수증입니다.",
+    )
+    assert folder == email_parser.SHOPPING_FOLDER
+
+
+def test_tving_subscription_classified_as_shopping():
+    """TVING 정기결제 예정 안내."""
+    folder = email_parser.classify_non_transaction(
+        "no-reply@tving.com",
+        "[TVING] 정기결제 예정 내역 안내",
+    )
+    assert folder == email_parser.SHOPPING_FOLDER
+
+
+def test_merchant_order_summary_classified_as_shopping():
+    """가야미 주문내역서 — '주문내역' 신규 키워드."""
+    folder = email_parser.classify_non_transaction(
+        "gayamy@gayamy.co.kr",
+        "가야미 주문내역서 확인 메일입니다.",
+    )
+    assert folder == email_parser.SHOPPING_FOLDER
+
+
+def test_payment_subject_alone_catches_unknown_sender():
+    """미등록 발신자라도 '결제하신' 제목 키워드로 매칭."""
+    folder = email_parser.classify_non_transaction(
+        "unknown@random-pg.example.com",
+        "임*재님, 어떤가맹점에서 결제하신 내역입니다.",
+    )
+    assert folder == email_parser.SHOPPING_FOLDER
+
+
+def test_card_alert_not_misclassified_by_new_keywords():
+    """카드사 알림 제목('결제 안내')은 새 키워드와 충돌 없이 None 유지.
+
+    카드 알림은 SENDER_PATTERNS가 먼저 잡으므로 classify_non_transaction
+    까지 도달하지 않지만, 만에 하나 미등록 카드 발신자라도 잘못 쇼핑
+    분류되면 안 되므로 가드.
+    """
+    folder = email_parser.classify_non_transaction(
+        "noreply@some-card-issuer.example",
+        "[카드] 결제 안내 - 1,000원 승인",
+    )
+    assert folder is None
