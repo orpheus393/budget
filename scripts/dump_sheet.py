@@ -4,7 +4,8 @@ GitHub Actions 워크플로 'sheet 덤프' 단계에서 사용.
 
 환경변수:
 - GOOGLE_SHEET_ID, GOOGLE_CREDS_JSON: 기존 워크플로와 동일
-- SOURCE_FILTER: 출처 (예: "BC카드", 미지정 시 전체)
+- SOURCE_FILTER: 출처 (예: "BC카드"). 부분 일치 — "BC카드"로 검색하면
+  "BC카드", "BC카드(신용)", "BC카드(체크)" 모두 매칭. 미지정 시 전체.
 - LIMIT: 최대 출력 행 수 (기본 50)
 """
 
@@ -55,18 +56,20 @@ def main():
     print("-" * 120)
 
     matched = 0
+    total_match = 0
     for row in rows[1:]:
         if source_filter:
-            if len(row) < 3 or row[2] != source_filter:
+            if len(row) < 3 or source_filter not in row[2]:
                 continue
-        print(" | ".join(row))
-        matched += 1
-        if matched >= limit:
-            print(f"... ({limit}행 출력 후 중단)")
-            break
+        total_match += 1
+        if matched < limit:
+            print(" | ".join(row))
+            matched += 1
+            if matched == limit:
+                print(f"... ({limit}행 출력 후 truncate, 매칭 행은 계속 셈)")
 
     print("-" * 120)
-    print(f"총 {matched}행 출력 (source_filter={source_filter or '(전체)'})")
+    print(f"매칭 행 {total_match}개 (출력 {matched}행, source_filter={source_filter or '(전체)'})")
 
 
 if __name__ == "__main__":
