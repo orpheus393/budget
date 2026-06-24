@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'app.py'
+      - 'scripts/**'
       - 'tests/**'
       - 'requirements*.txt'
       - '.github/workflows/test.yml'
@@ -11,6 +12,7 @@ on:
     branches: [main]
     paths:
       - 'app.py'
+      - 'scripts/**'
       - 'tests/**'
       - 'requirements*.txt'
 
@@ -36,3 +38,8 @@ jobs:
 
       - name: pytest 실행
         run: python -m pytest tests/ -v --tb=short
+
+      - name: 스크립트 단위 테스트 (email_parser, ibk_parser)
+        run: |
+          python scripts/test_email_parser.py
+          python scripts/test_ibk_parser.py
