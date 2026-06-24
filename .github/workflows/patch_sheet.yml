@@ -1,0 +1,79 @@
+name: 시트 패치 (재분류 + 중복 제거)
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: '작업 (recategorize | dedup_ibk_bc)'
+        required: true
+        default: 'recategorize'
+        type: choice
+        options:
+          - recategorize
+          - dedup_ibk_bc
+      dry_run:
+        description: 'DRY_RUN — true면 미리보기만'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      date_from:
+        description: '시작일 YYYY-MM-DD (recategorize용, 선택)'
+        required: false
+        default: ''
+      date_to:
+        description: '종료일 YYYY-MM-DD (recategorize용, 선택)'
+        required: false
+        default: ''
+      source_filter:
+        description: '출처 부분 일치 (recategorize용, 선택)'
+        required: false
+        default: ''
+      merchant_contains:
+        description: '가맹점 부분 일치 (recategorize용, 선택)'
+        required: false
+        default: ''
+      new_category:
+        description: '새 카테고리 (recategorize 필수)'
+        required: false
+        default: '여행/항공'
+      skip_categories:
+        description: '재분류 건너뛸 기존 카테고리 csv (선택)'
+        required: false
+        default: '주거/대출,부채청산,어머니차입금,자기이체,개인송금,수입,환불/캐시백,통신,구독,보험/금융'
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'gspread>=6.0.0' 'google-auth>=2.28.0'
+
+      - name: 패치 실행
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          OPERATION: ${{ inputs.operation }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          DATE_FROM: ${{ inputs.date_from }}
+          DATE_TO: ${{ inputs.date_to }}
+          SOURCE_FILTER: ${{ inputs.source_filter }}
+          MERCHANT_CONTAINS: ${{ inputs.merchant_contains }}
+          NEW_CATEGORY: ${{ inputs.new_category }}
+          SKIP_CATEGORIES: ${{ inputs.skip_categories }}
+        run: python scripts/patch_sheet.py

@@ -76,6 +76,12 @@ def main():
     big_singles = []
     # 카드비 (각 카드사 자동이체)
     card_bills = defaultdict(list)  # 출처 → [(date, amount, 내역)]
+    # 사용자 지정 날짜 범위 내 전체 거래 (제주여행 등 점검용)
+    date_range_rows = []
+    range_from = os.environ.get("DATE_FROM", "").strip()
+    range_to = os.environ.get("DATE_TO", "").strip()
+    dr_from = parse_date(range_from) if range_from else None
+    dr_to = parse_date(range_to) if range_to else None
 
     all_dates = []
 
@@ -92,6 +98,10 @@ def main():
         all_dates.append(d)
         ym = (d.year, d.month)
         cat_counts[cat] += 1
+
+        # 사용자 지정 범위 점검
+        if dr_from and dr_to and dr_from <= d <= dr_to:
+            date_range_rows.append((d, src, typ, amt, mer, cat))
 
         # 손익 외 제외
         if cat in NON_PNL or typ == "입금":
@@ -235,6 +245,18 @@ def main():
             print(f"- {msg}")
     else:
         print("- 특이사항 없음")
+
+    # 9) 사용자 지정 날짜 범위 전체 거래 (DATE_FROM~DATE_TO 환경변수)
+    if dr_from and dr_to and date_range_rows:
+        print(f"\n## 📅 지정 기간 ({dr_from} ~ {dr_to}) 전체 거래 ({len(date_range_rows)}건)")
+        print("| 날짜 | 출처 | 유형 | 금액 | 가맹점 | 카테고리 |")
+        print("|---|---|---|---:|---|---|")
+        date_range_rows.sort(key=lambda r: (r[0], r[1]))
+        out_sum = sum(r[3] for r in date_range_rows if r[2] == "출금")
+        in_sum = sum(r[3] for r in date_range_rows if r[2] == "입금")
+        for d, src, typ, amt, mer, cat in date_range_rows:
+            print(f"| {d} | {src} | {typ} | {amt:,} | {mer[:30]} | {cat} |")
+        print(f"\n**기간 합계**: 출금 {out_sum:,} / 입금 {in_sum:,} / 순 {out_sum - in_sum:+,}")
 
 
 if __name__ == "__main__":
