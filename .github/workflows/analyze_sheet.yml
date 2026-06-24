@@ -2,6 +2,15 @@ name: 시트 분석 요약 (수동 실행)
 
 on:
   workflow_dispatch:
+    inputs:
+      date_from:
+        description: '특정 기간 시작일 (YYYY-MM-DD, 선택, 비우면 생략)'
+        required: false
+        default: ''
+      date_to:
+        description: '특정 기간 종료일 (YYYY-MM-DD, 선택)'
+        required: false
+        default: ''
 
 jobs:
   analyze:
@@ -27,4 +36,6 @@ jobs:
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          DATE_FROM: ${{ inputs.date_from }}
+          DATE_TO: ${{ inputs.date_to }}
         run: python scripts/analyze_sheet.py
