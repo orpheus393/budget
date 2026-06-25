@@ -31,9 +31,12 @@ jobs:
           sudo apt-get install -y tesseract-ocr tesseract-ocr-kor
 
       - name: 의존성 설치
+        # requirements.txt 전체 설치 — PR CI(test.yml)와 동일한 의존성 셋.
+        # 가벼운 부분집합만 설치하던 과거 방식은 cron 환경 ≠ test 환경
+        # 갭으로 ModuleNotFoundError 회귀 위험 (PR #28 핫픽스 참고).
         run: |
           python -m pip install --upgrade pip
-          pip install 'gspread>=6.0.0' 'google-auth>=2.28.0' 'pdfplumber>=0.11.0' 'pymupdf>=1.24.0'
+          pip install -r requirements.txt
 
       - name: 파서 단위 테스트
         run: python scripts/test_email_parser.py
@@ -50,12 +53,25 @@ jobs:
           STATEMENT_LOOKBACK_DAYS: "35"
         run: python scripts/email_parser.py
 
-      - name: 실패 시 슬랙 알림 (SLACK_WEBHOOK_URL 설정된 경우)
-        if: failure() && env.SLACK_WEBHOOK_URL != ''
+      - name: 실패 시 슬랙 알림 (직전 실패와 같은 커밋이면 dedup)
+        if: failure()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL 미설정 — 알림 스킵"
+            exit 0
+          fi
+          # 직전 5개 cron 실행 중 같은 커밋에서 failure가 있었으면 알림 스킵
+          # (같은 sha 반복 실패 시 매시간 알림 폭주 방지)
+          prev_failures=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/fetch_emails.yml/runs?per_page=6" \
+            --jq '.workflow_runs | map(select(.id != ${{ github.run_id }})) | .[0:5] | map(select(.conclusion == "failure" and .head_sha == "${{ github.sha }}")) | length')
+          if [ "$prev_failures" -gt 0 ]; then
+            echo "직전 5개 run 중 같은 커밋 (${{ github.sha }})에서 failure 이미 ${prev_failures}회 — 알림 dedup 스킵"
+            exit 0
+          fi
           curl -s -X POST -H 'Content-Type: application/json' \
             --data "{\"text\": \":x: *가계부 cron 실패* — workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
             "$SLACK_WEBHOOK_URL" || true
-
