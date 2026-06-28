@@ -8,6 +8,7 @@ on:
       - 'tests/**'
       - 'requirements*.txt'
       - '.github/workflows/test.yml'
+      - '.github/workflows/fetch_emails.yml'
   push:
     branches: [main]
     paths:
@@ -43,3 +44,32 @@ jobs:
         run: |
           python scripts/test_email_parser.py
           python scripts/test_ibk_parser.py
+
+  cron-smoke:
+    # cron 환경(fetch_emails.yml)이 사용하는 의존성으로 cron이 호출하는
+    # 스크립트를 import·실행해 ModuleNotFoundError 등을 PR 시점에 사전 차단.
+    # PR #28 회귀 (bs4 누락) 재발 방지가 목적.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: cron 환경과 동일하게 requirements.txt 설치
+        # fetch_emails.yml의 의존성 설치 명령과 정확히 일치해야 함.
+        # 한 쪽이 변경되면 양쪽 동기화 필요 — 이 job 자체가 동기화 강제.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: cron이 호출하는 스크립트 smoke check (import + 단위 테스트)
+        run: |
+          python -c "import sys; sys.path.insert(0, 'scripts'); import email_parser; print('email_parser import OK')"
+          python scripts/test_email_parser.py
