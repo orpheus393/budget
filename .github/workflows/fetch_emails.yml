@@ -2,13 +2,17 @@ name: 가계부 이메일 자동 수집
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 매시간 실행
+    # 1일 1회 (00:00 UTC = 09:00 KST). 한국 은행·카드사는 실시간 입출금/결제
+    # 알림을 이메일로 보내지 않음 (앱푸시·카톡·SMS만). 이메일로 실제 오는 건
+    # 월 1회 카드 명세서(BC PDF, KB HTML)뿐 — STATEMENT_LOOKBACK_DAYS=35라
+    # 하루 1회로도 놓치지 않음. 매시간 cron은 가져올 게 없어 낭비였음.
+    - cron: '0 0 * * *'
   workflow_dispatch:       # 수동 실행 버튼
     inputs:
       lookback_hours:
-        description: '검색 기간 (시간). 누적 메일 일회 정리 시 720(30일) 권장'
+        description: '검색 기간 (시간). 1일 1회 cron 기준 기본 26시간. 누적 메일 일회 정리 시 720(30일) 권장'
         required: false
-        default: '2'
+        default: '26'
 
 jobs:
   fetch:
@@ -49,7 +53,7 @@ jobs:
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           BC_PDF_PASSWORD: ${{ secrets.BC_PDF_PASSWORD }}
           ENABLE_EMAIL_CLEANUP: "true"
-          LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '2' }}
+          LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '26' }}
           STATEMENT_LOOKBACK_DAYS: "35"
         run: python scripts/email_parser.py
 
