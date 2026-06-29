@@ -1407,6 +1407,81 @@ EXPECTED_SOURCES = (
 )
 
 
+def classify_input_path(origin: str, source: str = "") -> str:
+    """한 행이 어느 경로로 시트에 들어왔는지 '원문' 컬럼으로 추론.
+
+    반환: "수동"(대시보드 Excel 업로드) | "자동"(cron 이메일 파싱) | "불명".
+
+    근거 — 각 코드가 '원문'에 남기는 고정 prefix:
+      · app.py 수동 업로드: "현대카드 ...", "IBK통장|...", "카카오뱅크 ..."
+      · email_parser cron: "BC카드 월간명세서", KB/PG 이메일 제목 등
+    한국 은행·카드사는 실시간 거래 알림을 이메일로 안 보내므로(앱푸시·SMS만)
+    cron이 자동 수집하는 건 사실상 월간 카드 명세서뿐. 나머지는 수동 Excel.
+    """
+    o = (origin or "").strip()
+    # 1) 수동 업로드 — app.py가 박는 고정 prefix (가장 신뢰도 높음)
+    if o.startswith("현대카드") or o.startswith("IBK통장") or o.startswith("카카오뱅크"):
+        return "수동"
+    # 2) 자동 — cron 이메일 파싱이 박는 마커
+    if "월간명세서" in o:
+        return "자동"
+    # 3) 출처 기반 fallback — 원문이 비었거나 패턴이 모호할 때
+    src = (source or "").strip()
+    if src in ("BC카드", "BC카드(신용)", "BC카드(체크)", "KB카드"):
+        return "자동"  # 카드 명세서는 이메일로만 들어옴
+    if src in ("현대카드", "IBK기업은행", "카카오뱅크"):
+        return "수동"  # 실시간 이메일 알림이 없어 Excel 업로드뿐
+    return "불명"
+
+
+def _input_path_breakdown(df_src):
+    """출처 × 입력경로(자동/수동/불명) 집계 + 자동↔수동 중복 의심 행 탐지.
+
+    반환: (rows, dup_rows)
+      rows: [{출처, 경로, 행수, 최신}] — 출처·경로별 집계
+      dup_rows: [{날짜, 금액, 내역, 경로들}] — 같은 거래가 자동·수동 양쪽에 존재
+    """
+    if df_src is None or df_src.empty:
+        return [], []
+    work = df_src.copy()
+    origins = work["원문"] if "원문" in work.columns else ["" for _ in range(len(work))]
+    work["_path"] = [
+        classify_input_path(str(o), str(s))
+        for o, s in zip(origins, work["출처"])
+    ]
+    rows = []
+    for (src, path), grp in work.groupby(["출처", "_path"]):
+        latest = grp["날짜"].max()
+        rows.append({
+            "출처": src,
+            "경로": path,
+            "행수": len(grp),
+            "최신": latest.strftime("%Y-%m-%d") if pd.notna(latest) else "-",
+        })
+    rows.sort(key=lambda r: (-r["행수"], r["출처"]))
+
+    # 중복 의심: 같은 (날짜·|금액|·내역 앞 8자)이 '자동'과 '수동' 양쪽에 존재
+    dup_rows = []
+    if "금액" in work.columns:
+        work["_key"] = (
+            work["날짜"].dt.strftime("%Y-%m-%d").fillna("")
+            + "|" + work["금액"].abs().astype("int64", errors="ignore").astype(str)
+            + "|" + work["내역"].astype(str).str.replace(r"\s+", "", regex=True).str[:8]
+        )
+        for key, grp in work.groupby("_key"):
+            paths = set(grp["_path"])
+            if "자동" in paths and "수동" in paths:
+                first = grp.iloc[0]
+                dup_rows.append({
+                    "날짜": first["날짜"].strftime("%Y-%m-%d") if pd.notna(first["날짜"]) else "-",
+                    "금액": int(abs(first["금액"])) if pd.notna(first["금액"]) else 0,
+                    "내역": str(first["내역"])[:20],
+                    "경로들": " + ".join(sorted(paths)),
+                })
+        dup_rows.sort(key=lambda r: -r["금액"])
+    return rows, dup_rows
+
+
 def _data_status_rows(df_src):
     if df_src is None or df_src.empty:
         return [{"출처": exp, "행수": 0, "최신": "-", "상태": "⚪"} for exp in EXPECTED_SOURCES]
@@ -1474,6 +1549,34 @@ with st.sidebar.expander("📊 데이터 입력 현황", expanded=True):
         "🟢 1주 이내 · 🟡 1개월 이내 · 🔴 1개월+ 오래됨 · ⚪ 아직 입력 안 됨. "
         "업로드 후 안 보이면 🔄 데이터 새로고침 눌러보세요."
     )
+
+# ── 🔎 입력 경로 점검 (자동 cron vs 수동 Excel) ───────
+# 각 행이 cron 이메일 파싱(자동)으로 들어왔는지, 대시보드 Excel 업로드(수동)로
+# 들어왔는지 '원문' prefix로 추론. 같은 거래가 양쪽에 중복 등록됐는지도 감지.
+with st.sidebar.expander("🔎 입력 경로 점검", expanded=False):
+    path_rows, dup_rows = _input_path_breakdown(df_all)
+    if not path_rows:
+        st.caption("데이터 없음")
+    else:
+        if dup_rows:
+            dl = [f"⚠️ **자동·수동 중복 의심 {len(dup_rows)}건**"]
+            for d in dup_rows[:8]:
+                dl.append(f"  • {d['날짜']} {d['금액']:,}원 {d['내역']} ({d['경로들']})")
+            if len(dup_rows) > 8:
+                dl.append(f"  … 외 {len(dup_rows) - 8}건")
+            st.warning("\n".join(dl))
+        _path_icon = {"자동": "🤖", "수동": "✋", "불명": "❔"}
+        for r in path_rows:
+            st.markdown(
+                f"{_path_icon.get(r['경로'], '❔')} **{r['출처']}** "
+                f"<span style='color:#888'>{r['경로']}</span> — "
+                f"{r['행수']:,}건 · 최신 {r['최신']}",
+                unsafe_allow_html=True,
+            )
+        st.caption(
+            "🤖 자동(cron 이메일 명세서) · ✋ 수동(Excel 업로드) · ❔ 불명. "
+            "한국 카드·은행은 실시간 알림을 이메일로 안 보내 카드 명세서만 자동 수집됩니다."
+        )
 
 st.sidebar.markdown("---")
 
