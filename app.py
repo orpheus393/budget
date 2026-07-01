@@ -214,7 +214,7 @@ SCOPES = [
 ]
 
 
-SHEET_HEADER = ["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문", "잔액"]
+SHEET_HEADER = ["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문", "잔액", "입력경로"]
 
 
 def get_worksheet():
@@ -229,12 +229,16 @@ def get_worksheet():
         ws = sheet.add_worksheet("거래내역", rows=10000, cols=12)
         ws.append_row(SHEET_HEADER)
         return ws
-    # 기존 시트에 잔액 컬럼 자동 추가 (세션 1회만 체크)
-    if not st.session_state.get("_balance_col_checked"):
+    # 기존 시트에 잔액·입력경로 컬럼 자동 추가 (세션 1회만 체크)
+    if not st.session_state.get("_schema_col_checked"):
         header = ws.row_values(1)
-        if header and "잔액" not in header:
-            ws.update_cell(1, len(header) + 1, "잔액")
-        st.session_state["_balance_col_checked"] = True
+        if header:
+            if "잔액" not in header:
+                ws.update_cell(1, len(header) + 1, "잔액")
+                header = header + ["잔액"]
+            if "입력경로" not in header:
+                ws.update_cell(1, len(header) + 1, "입력경로")
+        st.session_state["_schema_col_checked"] = True
     return ws
 
 
@@ -253,6 +257,8 @@ def load_data():
         df["금액"] = pd.to_numeric(df["금액"], errors="coerce").fillna(0)
         if "잔액" in df.columns:
             df["잔액"] = pd.to_numeric(df["잔액"], errors="coerce")
+        if "입력경로" in df.columns:
+            df["입력경로"] = df["입력경로"].astype(str).replace("nan", "")
         df = df.dropna(subset=["날짜"])
         df = df.sort_values("날짜", ascending=False)
         return df
@@ -711,10 +717,12 @@ def append_transactions_to_sheet(transactions: list[dict]) -> int:
             continue
         existing_keys.add(key)
         bal = tx.get("잔액")
+        # 입력경로: 대시보드 업로드는 전부 수동. tx가 명시하지 않으면 "수동:{출처}".
+        path = tx.get("입력경로") or f"수동:{tx['출처']}"
         new_rows.append([
             tx["날짜"], tx.get("시간", ""), tx["출처"], tx["유형"],
             tx["금액"], tx["내역"], tx["카테고리"], tx.get("원문", ""),
-            "" if bal is None else bal,
+            "" if bal is None else bal, path,
         ])
 
     if new_rows:
@@ -1407,25 +1415,33 @@ EXPECTED_SOURCES = (
 )
 
 
-def classify_input_path(origin: str, source: str = "") -> str:
-    """한 행이 어느 경로로 시트에 들어왔는지 '원문' 컬럼으로 추론.
+def classify_input_path(origin: str, source: str = "", explicit: str = "") -> str:
+    """한 행이 어느 경로로 시트에 들어왔는지 판정.
 
     반환: "수동"(대시보드 Excel 업로드) | "자동"(cron 이메일 파싱) | "불명".
 
-    근거 — 각 코드가 '원문'에 남기는 고정 prefix:
-      · app.py 수동 업로드: "현대카드 ...", "IBK통장|...", "카카오뱅크 ..."
-      · email_parser cron: "BC카드 월간명세서", KB/PG 이메일 제목 등
+    우선순위:
+      1) '입력경로' 컬럼의 명시 태그 (신규 행, 100% 확실) — "자동:..."/"수동:..."
+      2) '원문' 컬럼 prefix 추론 (마킹 이전 기존 행):
+         · 수동 업로드: "현대카드 ...", "IBK통장|...", "카카오뱅크 ..."
+         · cron 자동: "BC카드 월간명세서", KB/PG 이메일 제목 등
+      3) 출처 기반 fallback.
     한국 은행·카드사는 실시간 거래 알림을 이메일로 안 보내므로(앱푸시·SMS만)
     cron이 자동 수집하는 건 사실상 월간 카드 명세서뿐. 나머지는 수동 Excel.
     """
+    # 1) 명시 태그 (가장 확실)
+    e = (explicit or "").strip()
+    if e.startswith("자동"):
+        return "자동"
+    if e.startswith("수동"):
+        return "수동"
+    # 2) 원문 prefix 추론
     o = (origin or "").strip()
-    # 1) 수동 업로드 — app.py가 박는 고정 prefix (가장 신뢰도 높음)
     if o.startswith("현대카드") or o.startswith("IBK통장") or o.startswith("카카오뱅크"):
         return "수동"
-    # 2) 자동 — cron 이메일 파싱이 박는 마커
     if "월간명세서" in o:
         return "자동"
-    # 3) 출처 기반 fallback — 원문이 비었거나 패턴이 모호할 때
+    # 3) 출처 기반 fallback
     src = (source or "").strip()
     if src in ("BC카드", "BC카드(신용)", "BC카드(체크)", "KB카드"):
         return "자동"  # 카드 명세서는 이메일로만 들어옴
@@ -1445,9 +1461,10 @@ def _input_path_breakdown(df_src):
         return [], []
     work = df_src.copy()
     origins = work["원문"] if "원문" in work.columns else ["" for _ in range(len(work))]
+    explicits = work["입력경로"] if "입력경로" in work.columns else ["" for _ in range(len(work))]
     work["_path"] = [
-        classify_input_path(str(o), str(s))
-        for o, s in zip(origins, work["출처"])
+        classify_input_path(str(o), str(s), str(e))
+        for o, s, e in zip(origins, work["출처"], explicits)
     ]
     rows = []
     for (src, path), grp in work.groupby(["출처", "_path"]):

@@ -17,6 +17,13 @@
    IBK 행을 삭제 (BC체크가 더 정확한 가맹점명 보유).
    - DRY_RUN 동일
 
+3) OPERATION=backfill_input_path
+   '입력경로' 컬럼이 없으면 추가하고, 빈 행을 원문·출처 추론으로 채움.
+   기존 행은 당시 경로 기록이 없어 추론이 최선(자동:{출처}/수동:{출처}).
+   신규 행은 app.py·email_parser가 이미 명시 태그를 박으므로 이 backfill은
+   1회성. 이미 태그가 있는 행은 건드리지 않음.
+   - DRY_RUN 동일
+
 환경변수: GOOGLE_SHEET_ID, GOOGLE_CREDS_JSON 필수.
 """
 
@@ -184,17 +191,95 @@ def op_dedup_ibk_bc(ws, dry_run):
     print(f"\n{len(to_delete)}행 삭제 완료")
 
 
+def _infer_input_path(origin: str, source: str) -> str:
+    """기존 행의 입력경로를 원문·출처로 추론. app.classify_input_path와 동일 규칙.
+
+    (app.py는 streamlit 의존이라 여기서 못 import → 규칙만 재현.)
+    반환: "자동:{출처}" | "수동:{출처}" | "불명".
+    """
+    o = (origin or "").strip()
+    src = (source or "").strip()
+    # 원문 prefix
+    if o.startswith("현대카드") or o.startswith("IBK통장") or o.startswith("카카오뱅크"):
+        return f"수동:{src}" if src else "수동"
+    if "월간명세서" in o:
+        return f"자동:{src}" if src else "자동"
+    # 출처 fallback
+    if src in ("BC카드", "BC카드(신용)", "BC카드(체크)", "KB카드"):
+        return f"자동:{src}"
+    if src in ("현대카드", "IBK기업은행", "카카오뱅크"):
+        return f"수동:{src}"
+    return "불명"
+
+
+def op_backfill_input_path(ws, dry_run):
+    rows = ws.get_all_values()
+    if not rows:
+        print("시트 비어있음")
+        return
+    header = rows[0]
+    # 컬럼 확보
+    if "입력경로" in header:
+        path_col = header.index("입력경로")  # 0-base
+    else:
+        path_col = len(header)
+        if not dry_run:
+            ws.update_cell(1, path_col + 1, "입력경로")
+        print(f"'입력경로' 컬럼 신규 추가 (col {path_col + 1})")
+
+    src_col = header.index("출처") if "출처" in header else 2
+    origin_col = header.index("원문") if "원문" in header else 7
+
+    updates = []  # (row_num, value)
+    preview = []
+    for i, row in enumerate(rows[1:], start=2):
+        if not row or len(row) <= src_col:
+            continue
+        cur = row[path_col] if len(row) > path_col else ""
+        if cur.strip():
+            continue  # 이미 태그 있음 (신규 행) → 건드리지 않음
+        origin = row[origin_col] if len(row) > origin_col else ""
+        source = row[src_col] if len(row) > src_col else ""
+        val = _infer_input_path(origin, source)
+        updates.append((i, val))
+        if len(preview) < 20:
+            preview.append(f"  row {i}: {source} | {origin[:24]} → {val}")
+
+    print(f"입력경로 backfill 대상: {len(updates)}행")
+    print("-" * 80)
+    for line in preview:
+        print(line)
+    if len(updates) > 20:
+        print(f"  ... 외 {len(updates) - 20}개")
+
+    if dry_run:
+        print("\nDRY_RUN — 실제 기록 안 함. DRY_RUN=false 로 재실행.")
+        return
+    if not updates:
+        print("backfill할 빈 행 없음")
+        return
+
+    # A1 표기로 배치 업데이트 (입력경로 컬럼 1개)
+    col_letter = chr(ord("A") + path_col)  # 10번째=J. path_col<26 가정.
+    batch = [{"range": f"{col_letter}{rn}", "values": [[val]]} for rn, val in updates]
+    ws.batch_update(batch, value_input_option="RAW")
+    print(f"\n{len(updates)}행 입력경로 기록 완료")
+
+
 def main():
     op = os.environ.get("OPERATION", "").strip().lower()
     dry_run = os.environ.get("DRY_RUN", "true").lower() != "false"
-    if op not in ("recategorize", "dedup_ibk_bc"):
-        print(f"OPERATION 값 필요: 'recategorize' 또는 'dedup_ibk_bc'", file=sys.stderr)
+    valid = ("recategorize", "dedup_ibk_bc", "backfill_input_path")
+    if op not in valid:
+        print(f"OPERATION 값 필요: {' | '.join(valid)}", file=sys.stderr)
         sys.exit(1)
     ws = open_sheet()
     if op == "recategorize":
         op_recategorize(ws, dry_run)
-    else:
+    elif op == "dedup_ibk_bc":
         op_dedup_ibk_bc(ws, dry_run)
+    else:
+        op_backfill_input_path(ws, dry_run)
 
 
 if __name__ == "__main__":

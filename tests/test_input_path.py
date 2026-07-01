@@ -16,6 +16,20 @@ def _build_df(rows):
     return df
 
 
+# ── 명시 태그(입력경로 컬럼) 우선 ─────────────────────
+def test_explicit_auto_tag_wins():
+    # 원문·출처가 수동을 가리켜도 명시 태그가 자동이면 자동
+    assert app.classify_input_path("현대카드 | X", "현대카드", "자동:BC카드(신용)") == "자동"
+
+
+def test_explicit_manual_tag_wins():
+    assert app.classify_input_path("BC카드 월간명세서", "BC카드(신용)", "수동:현대카드") == "수동"
+
+
+def test_explicit_empty_falls_back_to_origin():
+    assert app.classify_input_path("현대카드 | X", "현대카드", "") == "수동"
+
+
 # ── classify_input_path: 원문 prefix 기반 ──────────────
 def test_manual_hyundai_by_origin():
     assert app.classify_input_path("현대카드 | 스타벅스", "현대카드") == "수동"
@@ -96,6 +110,17 @@ def test_breakdown_no_false_duplicate_different_amount():
     ])
     rows, dups = app._input_path_breakdown(df)
     assert dups == []
+
+
+def test_breakdown_uses_explicit_column():
+    # 입력경로 컬럼이 있으면 원문·출처 추론보다 우선
+    df = _build_df([
+        {"날짜": "2026-05-01", "출처": "네이버페이", "유형": "입금", "금액": 5000,
+         "내역": "환급", "카테고리": "수입", "원문": "네이버페이 알림",
+         "입력경로": "자동:네이버페이"},
+    ])
+    rows, dups = app._input_path_breakdown(df)
+    assert rows[0]["경로"] == "자동"  # 원문만이면 '불명'인데 명시 태그로 '자동'
 
 
 def test_breakdown_empty_df():
