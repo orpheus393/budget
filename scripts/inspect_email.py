@@ -55,12 +55,26 @@ def decode_str(s):
     return "".join(out)
 
 
+def header_str(value) -> str:
+    """msg.get(...) 결과를 안전하게 str로. None/Header/str 모두 처리.
+
+    email 라이브러리는 헤더에 비ASCII가 있으면 str이 아닌 Header 객체를
+    반환할 수 있다. 그대로 .lower()를 호출하면 AttributeError로 크래시.
+    (email_parser.py의 동명 헬퍼와 동일 — 두 스크립트 모두 IMAP 파싱.)
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def best_text(msg):
     """text/plain 우선, 없으면 text/html 원문 반환 (디코딩만, strip 안 함)."""
     plain, html = "", ""
     for part in msg.walk():
         ctype = part.get_content_type()
-        disp = (part.get("Content-Disposition") or "").lower()
+        disp = header_str(part.get("Content-Disposition")).lower()
         if "attachment" in disp:
             continue
         try:
@@ -164,7 +178,7 @@ def main():
 
             for part in msg.walk():
                 fn = decode_str(part.get_filename() or "")
-                if not fn and "attachment" not in (part.get("Content-Disposition") or "").lower():
+                if not fn and "attachment" not in header_str(part.get("Content-Disposition")).lower():
                     continue
                 if not fn:
                     continue

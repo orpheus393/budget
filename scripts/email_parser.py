@@ -1737,11 +1737,15 @@ def save_to_sheets(transactions: list):
         print("새로운 거래 없음")
         return
 
+    # 시트 스키마: 날짜·시간·출처·유형·금액·내역·카테고리·원문·잔액·입력경로 (10열)
+    # 대시보드(app.py)와 동일한 컬럼 순서로 써야 컬럼이 어긋나지 않음.
+    SHEET_COLS = ["날짜", "시간", "출처", "유형", "금액", "내역",
+                  "카테고리", "원문", "잔액", "입력경로"]
     try:
         ws = sheet.worksheet("거래내역")
     except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet("거래내역", rows=10000, cols=10)
-        ws.append_row(["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문"])
+        ws = sheet.add_worksheet("거래내역", rows=10000, cols=12)
+        ws.append_row(SHEET_COLS)
 
     existing = ws.get_all_values()
     existing_keys = set()
@@ -1756,9 +1760,12 @@ def save_to_sheets(transactions: list):
         if key in existing_keys:
             continue
         existing_keys.add(key)
+        # email_parser는 cron에서만 실행 → 전부 자동 수집. tx가 명시 안 하면 "자동:{출처}".
+        path = tx.get("입력경로") or f"자동:{tx['출처']}"
         new_rows.append([
             tx["날짜"], tx["시간"], tx["출처"], tx["유형"],
             tx["금액"], tx["내역"], tx["카테고리"], tx["원문"],
+            tx.get("잔액", ""), path,
         ])
 
     if new_rows:

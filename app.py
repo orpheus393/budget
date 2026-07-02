@@ -214,7 +214,7 @@ SCOPES = [
 ]
 
 
-SHEET_HEADER = ["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문", "잔액"]
+SHEET_HEADER = ["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문", "잔액", "입력경로"]
 
 
 def get_worksheet():
@@ -229,12 +229,16 @@ def get_worksheet():
         ws = sheet.add_worksheet("거래내역", rows=10000, cols=12)
         ws.append_row(SHEET_HEADER)
         return ws
-    # 기존 시트에 잔액 컬럼 자동 추가 (세션 1회만 체크)
-    if not st.session_state.get("_balance_col_checked"):
+    # 기존 시트에 잔액·입력경로 컬럼 자동 추가 (세션 1회만 체크)
+    if not st.session_state.get("_schema_col_checked"):
         header = ws.row_values(1)
-        if header and "잔액" not in header:
-            ws.update_cell(1, len(header) + 1, "잔액")
-        st.session_state["_balance_col_checked"] = True
+        if header:
+            if "잔액" not in header:
+                ws.update_cell(1, len(header) + 1, "잔액")
+                header = header + ["잔액"]
+            if "입력경로" not in header:
+                ws.update_cell(1, len(header) + 1, "입력경로")
+        st.session_state["_schema_col_checked"] = True
     return ws
 
 
@@ -253,6 +257,8 @@ def load_data():
         df["금액"] = pd.to_numeric(df["금액"], errors="coerce").fillna(0)
         if "잔액" in df.columns:
             df["잔액"] = pd.to_numeric(df["잔액"], errors="coerce")
+        if "입력경로" in df.columns:
+            df["입력경로"] = df["입력경로"].astype(str).replace("nan", "")
         df = df.dropna(subset=["날짜"])
         df = df.sort_values("날짜", ascending=False)
         return df
@@ -711,10 +717,12 @@ def append_transactions_to_sheet(transactions: list[dict]) -> int:
             continue
         existing_keys.add(key)
         bal = tx.get("잔액")
+        # 입력경로: 대시보드 업로드는 전부 수동. tx가 명시하지 않으면 "수동:{출처}".
+        path = tx.get("입력경로") or f"수동:{tx['출처']}"
         new_rows.append([
             tx["날짜"], tx.get("시간", ""), tx["출처"], tx["유형"],
             tx["금액"], tx["내역"], tx["카테고리"], tx.get("원문", ""),
-            "" if bal is None else bal,
+            "" if bal is None else bal, path,
         ])
 
     if new_rows:
@@ -1407,6 +1415,90 @@ EXPECTED_SOURCES = (
 )
 
 
+def classify_input_path(origin: str, source: str = "", explicit: str = "") -> str:
+    """한 행이 어느 경로로 시트에 들어왔는지 판정.
+
+    반환: "수동"(대시보드 Excel 업로드) | "자동"(cron 이메일 파싱) | "불명".
+
+    우선순위:
+      1) '입력경로' 컬럼의 명시 태그 (신규 행, 100% 확실) — "자동:..."/"수동:..."
+      2) '원문' 컬럼 prefix 추론 (마킹 이전 기존 행):
+         · 수동 업로드: "현대카드 ...", "IBK통장|...", "카카오뱅크 ..."
+         · cron 자동: "BC카드 월간명세서", KB/PG 이메일 제목 등
+      3) 출처 기반 fallback.
+    한국 은행·카드사는 실시간 거래 알림을 이메일로 안 보내므로(앱푸시·SMS만)
+    cron이 자동 수집하는 건 사실상 월간 카드 명세서뿐. 나머지는 수동 Excel.
+    """
+    # 1) 명시 태그 (가장 확실)
+    e = (explicit or "").strip()
+    if e.startswith("자동"):
+        return "자동"
+    if e.startswith("수동"):
+        return "수동"
+    # 2) 원문 prefix 추론
+    o = (origin or "").strip()
+    if o.startswith("현대카드") or o.startswith("IBK통장") or o.startswith("카카오뱅크"):
+        return "수동"
+    if "월간명세서" in o:
+        return "자동"
+    # 3) 출처 기반 fallback
+    src = (source or "").strip()
+    if src in ("BC카드", "BC카드(신용)", "BC카드(체크)", "KB카드"):
+        return "자동"  # 카드 명세서는 이메일로만 들어옴
+    if src in ("현대카드", "IBK기업은행", "카카오뱅크"):
+        return "수동"  # 실시간 이메일 알림이 없어 Excel 업로드뿐
+    return "불명"
+
+
+def _input_path_breakdown(df_src):
+    """출처 × 입력경로(자동/수동/불명) 집계 + 자동↔수동 중복 의심 행 탐지.
+
+    반환: (rows, dup_rows)
+      rows: [{출처, 경로, 행수, 최신}] — 출처·경로별 집계
+      dup_rows: [{날짜, 금액, 내역, 경로들}] — 같은 거래가 자동·수동 양쪽에 존재
+    """
+    if df_src is None or df_src.empty:
+        return [], []
+    work = df_src.copy()
+    origins = work["원문"] if "원문" in work.columns else ["" for _ in range(len(work))]
+    explicits = work["입력경로"] if "입력경로" in work.columns else ["" for _ in range(len(work))]
+    work["_path"] = [
+        classify_input_path(str(o), str(s), str(e))
+        for o, s, e in zip(origins, work["출처"], explicits)
+    ]
+    rows = []
+    for (src, path), grp in work.groupby(["출처", "_path"]):
+        latest = grp["날짜"].max()
+        rows.append({
+            "출처": src,
+            "경로": path,
+            "행수": len(grp),
+            "최신": latest.strftime("%Y-%m-%d") if pd.notna(latest) else "-",
+        })
+    rows.sort(key=lambda r: (-r["행수"], r["출처"]))
+
+    # 중복 의심: 같은 (날짜·|금액|·내역 앞 8자)이 '자동'과 '수동' 양쪽에 존재
+    dup_rows = []
+    if "금액" in work.columns:
+        work["_key"] = (
+            work["날짜"].dt.strftime("%Y-%m-%d").fillna("")
+            + "|" + work["금액"].abs().astype("int64", errors="ignore").astype(str)
+            + "|" + work["내역"].astype(str).str.replace(r"\s+", "", regex=True).str[:8]
+        )
+        for key, grp in work.groupby("_key"):
+            paths = set(grp["_path"])
+            if "자동" in paths and "수동" in paths:
+                first = grp.iloc[0]
+                dup_rows.append({
+                    "날짜": first["날짜"].strftime("%Y-%m-%d") if pd.notna(first["날짜"]) else "-",
+                    "금액": int(abs(first["금액"])) if pd.notna(first["금액"]) else 0,
+                    "내역": str(first["내역"])[:20],
+                    "경로들": " + ".join(sorted(paths)),
+                })
+        dup_rows.sort(key=lambda r: -r["금액"])
+    return rows, dup_rows
+
+
 def _data_status_rows(df_src):
     if df_src is None or df_src.empty:
         return [{"출처": exp, "행수": 0, "최신": "-", "상태": "⚪"} for exp in EXPECTED_SOURCES]
@@ -1474,6 +1566,34 @@ with st.sidebar.expander("📊 데이터 입력 현황", expanded=True):
         "🟢 1주 이내 · 🟡 1개월 이내 · 🔴 1개월+ 오래됨 · ⚪ 아직 입력 안 됨. "
         "업로드 후 안 보이면 🔄 데이터 새로고침 눌러보세요."
     )
+
+# ── 🔎 입력 경로 점검 (자동 cron vs 수동 Excel) ───────
+# 각 행이 cron 이메일 파싱(자동)으로 들어왔는지, 대시보드 Excel 업로드(수동)로
+# 들어왔는지 '원문' prefix로 추론. 같은 거래가 양쪽에 중복 등록됐는지도 감지.
+with st.sidebar.expander("🔎 입력 경로 점검", expanded=False):
+    path_rows, dup_rows = _input_path_breakdown(df_all)
+    if not path_rows:
+        st.caption("데이터 없음")
+    else:
+        if dup_rows:
+            dl = [f"⚠️ **자동·수동 중복 의심 {len(dup_rows)}건**"]
+            for d in dup_rows[:8]:
+                dl.append(f"  • {d['날짜']} {d['금액']:,}원 {d['내역']} ({d['경로들']})")
+            if len(dup_rows) > 8:
+                dl.append(f"  … 외 {len(dup_rows) - 8}건")
+            st.warning("\n".join(dl))
+        _path_icon = {"자동": "🤖", "수동": "✋", "불명": "❔"}
+        for r in path_rows:
+            st.markdown(
+                f"{_path_icon.get(r['경로'], '❔')} **{r['출처']}** "
+                f"<span style='color:#888'>{r['경로']}</span> — "
+                f"{r['행수']:,}건 · 최신 {r['최신']}",
+                unsafe_allow_html=True,
+            )
+        st.caption(
+            "🤖 자동(cron 이메일 명세서) · ✋ 수동(Excel 업로드) · ❔ 불명. "
+            "한국 카드·은행은 실시간 알림을 이메일로 안 보내 카드 명세서만 자동 수집됩니다."
+        )
 
 st.sidebar.markdown("---")
 

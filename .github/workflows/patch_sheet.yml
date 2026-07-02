@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: '작업 (recategorize | dedup_ibk_bc)'
+        description: '작업 (recategorize | dedup_ibk_bc | backfill_input_path)'
         required: true
         default: 'recategorize'
         type: choice
         options:
           - recategorize
           - dedup_ibk_bc
+          - backfill_input_path
       dry_run:
         description: 'DRY_RUN — true면 미리보기만'
         required: true

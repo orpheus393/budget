@@ -2,14 +2,25 @@
 
 ## 구조
 ```
-GitHub Actions (매시간)
-    → 네이버 이메일 파싱 (IBK기업은행, BC카드, IBK BC카드, 카카오뱅크, 현대카드, KB국민카드)
+GitHub Actions (1일 1회, 09:00 KST)
+    → 네이버 이메일 파싱
+        · 월간 카드 명세서 자동 수집: BC카드 PDF, KB국민카드 HTML
+        · 보금자리론 안내, (도착 시) 은행 통지 메일
+    → Google Sheets 저장
+          ↓
+사용자 수동 업로드 (대시보드)
+    · 현대카드 Excel, 카카오뱅크/IBK 거래내역 Excel
     → Google Sheets 저장
           ↓
 Streamlit Cloud (대시보드)
-    → Google Sheets 읽기
-    → 대시보드 표시
+    → Google Sheets 읽기 → 대시보드 표시
 ```
+
+> **수집 방식이 두 갈래인 이유**: 한국 은행·카드사는 실시간 입출금/결제 알림을
+> 이메일이 아니라 앱푸시·카카오톡·SMS로만 보냅니다. 이메일로 정기적으로 오는 건
+> **월 1회 카드 명세서**뿐이라, cron은 이것만 자동 수집하고 나머지(카뱅·IBK 통장,
+> 현대카드 사용내역)는 사용자가 각 앱에서 Excel을 받아 대시보드에 업로드합니다.
+> cron이 1일 1회인 것도 이 때문 — 매시간 돌려도 새로 올 메일이 없습니다.
 
 ## 설정 순서
 
@@ -154,11 +165,18 @@ pip install -r requirements-dev.txt
 python3 -m pytest tests/ -v
 ```
 
-`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 68개 테스트:
+`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 81개 테스트:
 - **test_analysis.py** (13개): _month_pnl·_net_worth_snapshot·detect_outliers·forecast_cash_flow·_normalize_korean_date·_delta·generate_annual_report·build_notification_text·send_slack_notification
 - **test_categorize.py** (14개): guess_category 분기·learn_category_overrides 학습 로직
 - **test_cleanup_summary.py** (5개): 이메일 정리 요약 (카테고리·제목·읽음 처리·길이 절단)
 - **test_email_classifier.py** (17개): 쇼핑/SNS/광고 분류, AliExpress·Amazon, 제목 공백 변형, PG·구독·영수증·고지서 케이스
 - **test_header_decoding.py** (4개): 이메일 Header 객체 안전 디코딩 (.lower() 크래시 방지)
+- **test_input_path.py** (13개): classify_input_path 자동/수동 추론 + 자동↔수동 중복 감지
 - **test_kb_parser.py** (9개): KB국민카드 HTML 명세서 파서 (할부 분담분 정합 포함)
 - **test_loan_parser.py** (6개): 보금자리론 안내 paste 회차 추출
+
+### 데이터 입력 경로 점검
+사이드바 `🔎 입력 경로 점검` expander가 각 행을 **🤖 자동(cron 이메일 명세서)** vs
+**✋ 수동(Excel 업로드)** 으로 분류해 출처별 집계. 같은 거래가 자동·수동 양쪽에
+중복 등록됐는지(예: BC카드 명세서 ↔ IBK 통장 echo)도 감지해 경고. 분류는 `원문`
+컬럼의 고정 prefix(`현대카드 ` `IBK통장|` `카카오뱅크 ` ↔ `월간명세서`)로 추론.
