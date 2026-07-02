@@ -700,6 +700,107 @@ def parse_kakaobank_file(uploaded_file, password: str | None = None) -> pd.DataF
     return pd.DataFrame(txs)
 
 
+class _BytesUpload:
+    """파싱 재시도를 위해 bytes를 반복해서 read()할 수 있는 업로드 어댑터."""
+
+    def __init__(self, name: str, raw: bytes):
+        self.name = name
+        self._raw = raw
+
+    def read(self):
+        return self._raw
+
+
+def parse_any_file(name: str, raw: bytes, password: str | None = None):
+    """파일 내용을 보고 어느 기관 것인지 감지해 알맞은 파서로 처리.
+
+    반환: (감지된 출처, DataFrame). 어느 파서에도 안 맞으면 ValueError.
+
+    감지 순서 (내용 기반):
+      · HTML 표: '거래일시'+'출금' 키워드 → IBK, '이용가맹점/이용일' → 현대카드
+      · 암호화 OLE: 카카오뱅크 (세 기관 중 암호화 파일은 카뱅뿐)
+      · xlsx/xls/csv: 헤더 키워드 시도 순서를 정해 순차 파싱
+    """
+    head = raw[:4096].decode("utf-8", errors="ignore")
+    head_cp949 = raw[:4096].decode("cp949", errors="ignore")
+    text_head = head + head_cp949
+    is_html = any(m in head.lower() for m in ("<html", "<!doctype", "<table", "<script"))
+    is_ole = raw[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # 암호화 xlsx 컨테이너
+    is_zip = raw[:2] == b"PK"  # 일반 xlsx
+
+    def _try_quiet(kind, fn):
+        """형식 불일치는 조용히 건너뛰고 None 반환."""
+        try:
+            df = fn(_BytesUpload(name, raw))
+            if df is not None and not df.empty:
+                return kind, df
+        except Exception:
+            pass
+        return None
+
+    def kakao(u):
+        return parse_kakaobank_file(u, password)
+
+    if is_ole:
+        # 세 기관 중 암호화 파일은 카카오뱅크뿐 — 비밀번호 요구/불일치
+        # ValueError 메시지를 사용자에게 그대로 보여줘야 하므로 직접 호출.
+        df = parse_kakaobank_file(_BytesUpload(name, raw), password)
+        if df is None or df.empty:
+            raise ValueError(f"'{name}' 해독은 됐지만 거래를 찾지 못했어요.")
+        return "카카오뱅크", df
+
+    if is_html:
+        # IBK 마커가 뚜렷하면 IBK 먼저, 아니면 현대카드 먼저
+        if "거래일시" in text_head or "거래내역조회" in text_head:
+            order = [("IBK기업은행", parse_ibk_account_file), ("현대카드", parse_hyundai_file)]
+        else:
+            order = [("현대카드", parse_hyundai_file), ("IBK기업은행", parse_ibk_account_file)]
+    elif is_zip:
+        order = [("카카오뱅크", kakao), ("현대카드", parse_hyundai_file)]
+    else:
+        # csv 또는 기타 텍스트
+        order = [("현대카드", parse_hyundai_file), ("IBK기업은행", parse_ibk_account_file)]
+
+    for kind, fn in order:
+        got = _try_quiet(kind, fn)
+        if got:
+            return got
+    raise ValueError(
+        f"'{name}' 형식을 인식하지 못했어요. 지원: 현대카드 Excel/CSV, "
+        f"IBK 거래내역 .xls(HTML), 카카오뱅크 .xlsx"
+    )
+
+
+def find_bc_echo_rows(df_new: pd.DataFrame, df_all: pd.DataFrame) -> pd.Series:
+    """업로드된 IBK 출금 중 BC카드(체크) 명세서와 겹치는 행(echo) 표시.
+
+    체크카드는 사용 즉시 IBK 통장에서 빠져 같은 거래가 BC체크 명세서(자동)와
+    IBK 업로드(수동) 양쪽에 기록됨 → 같은 (날짜, 금액)의 BC카드(체크) 행이
+    시트에 이미 있으면 True. 저장 전 기본 제외 대상으로 쓴다.
+    """
+    idx = pd.Series(False, index=df_new.index)
+    if df_new.empty or df_all is None or df_all.empty:
+        return idx
+    bc = df_all[(df_all["출처"] == "BC카드(체크)") & (df_all["유형"] == "출금")]
+    if bc.empty:
+        return idx
+    bc_keys = {
+        (d.strftime("%Y-%m-%d"), int(a))
+        for d, a in zip(bc["날짜"], bc["금액"])
+        if pd.notna(d) and pd.notna(a)
+    }
+    for i, row in df_new.iterrows():
+        if row.get("출처") != "IBK기업은행" or row.get("유형") != "출금":
+            continue
+        try:
+            key = (str(row["날짜"])[:10], int(row["금액"]))
+        except (ValueError, TypeError):
+            continue
+        if key in bc_keys:
+            idx.at[i] = True
+    return idx
+
+
 def append_transactions_to_sheet(transactions: list[dict]) -> int:
     """중복 제외하고 시트에 추가, 추가 건수 반환"""
     ws = get_worksheet()
@@ -2643,6 +2744,114 @@ if not df.empty:
 
 else:
     st.info(f"📭 {selected_month} 데이터가 없어요. 이메일 파싱이 실행되면 자동으로 채워집니다.")
+
+# ── 📥 통합 업로드 인박스 ─────────────────────────────
+# 현대카드·IBK·카카오뱅크 파일을 구분 없이 던지면 내용으로 감지 → 파싱 →
+# 중복/echo 점검 → 미리보기 → 승인 저장. 월말 결산의 진입점.
+st.markdown("---")
+st.subheader("📥 통합 업로드 인박스")
+st.caption(
+    "현대카드 Excel/CSV · IBK 거래내역 .xls · 카카오뱅크 .xlsx 를 한꺼번에 올리세요. "
+    "어느 기관 파일인지 자동으로 알아봅니다."
+)
+
+inbox_col_up, inbox_col_pw = st.columns([2, 1])
+with inbox_col_up:
+    inbox_files = st.file_uploader(
+        "파일 선택 (여러 개 가능)",
+        type=["xls", "xlsx", "csv", "html"],
+        accept_multiple_files=True,
+        key="inbox_upload",
+    )
+with inbox_col_pw:
+    inbox_pw = st.text_input(
+        "카카오뱅크 비밀번호 (있을 때만)",
+        type="password",
+        placeholder="보통 생년월일 6자리",
+        key="inbox_pw",
+    )
+
+if inbox_files:
+    parsed_frames = []   # (파일명, 출처, df)
+    parse_errors = []    # (파일명, 오류)
+    for f in inbox_files:
+        try:
+            kind, pdf_df = parse_any_file(f.name, f.read(), inbox_pw or None)
+            parsed_frames.append((f.name, kind, pdf_df))
+        except Exception as e:
+            parse_errors.append((f.name, str(e)))
+
+    for fname, err in parse_errors:
+        st.error(f"❌ {fname}: {err}")
+
+    if parsed_frames:
+        # 파일별 감지 결과 요약
+        summary_rows = [
+            {"파일": fn, "감지": kind, "거래": len(d), "합계": f"{d['금액'].sum():,.0f}원"}
+            for fn, kind, d in parsed_frames
+        ]
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        combined = pd.concat([d for _, _, d in parsed_frames], ignore_index=True)
+
+        # 시트 기준 중복(같은 날짜_출처_금액_내역) 미리 계산 — 저장 시에도 한 번 더 걸러짐
+        dup_mask = pd.Series(False, index=combined.index)
+        if not df_all.empty:
+            sheet_keys = {
+                f"{d.strftime('%Y-%m-%d')}_{s}_{int(a)}_{m}"
+                for d, s, a, m in zip(df_all["날짜"], df_all["출처"], df_all["금액"], df_all["내역"])
+                if pd.notna(d) and pd.notna(a)
+            }
+            for i, row in combined.iterrows():
+                try:
+                    k = f"{str(row['날짜'])[:10]}_{row['출처']}_{int(row['금액'])}_{row['내역']}"
+                except (ValueError, TypeError):
+                    continue
+                if k in sheet_keys:
+                    dup_mask.at[i] = True
+
+        # BC체크 ↔ IBK echo 의심
+        echo_mask = find_bc_echo_rows(combined, df_all)
+
+        n_dup, n_echo = int(dup_mask.sum()), int((echo_mask & ~dup_mask).sum())
+        n_new = len(combined) - n_dup - n_echo
+        st.markdown(
+            f"**저장 대상 {n_new}건** · 이미 시트에 있음 {n_dup}건 제외"
+            + (f" · ⚠️ BC체크 중복(echo) 의심 {n_echo}건" if n_echo else "")
+        )
+
+        exclude_echo = True
+        if n_echo:
+            with st.expander(f"⚠️ BC체크 명세서와 겹치는 IBK 거래 {n_echo}건", expanded=True):
+                st.dataframe(
+                    combined[echo_mask & ~dup_mask][["날짜", "금액", "내역", "출처"]],
+                    use_container_width=True, hide_index=True,
+                )
+                exclude_echo = st.checkbox(
+                    "echo 의심 거래 저장에서 제외 (이중계상 방지)", value=True, key="inbox_echo_skip"
+                )
+
+        keep_mask = ~dup_mask & (~echo_mask | (not exclude_echo))
+        to_save = combined[keep_mask].reset_index(drop=True)
+
+        if to_save.empty:
+            st.info("새로 저장할 거래가 없습니다 (전부 중복/제외).")
+        else:
+            edited_inbox = st.data_editor(
+                to_save, use_container_width=True, hide_index=True,
+                num_rows="dynamic", key="inbox_editor",
+            )
+            if st.button("📤 승인하고 시트에 저장", type="primary", key="inbox_save"):
+                try:
+                    txs = edited_inbox.to_dict(orient="records")
+                    added = append_transactions_to_sheet(txs)
+                    if added:
+                        st.success(f"✅ {added}건 저장 완료 (중복 {len(txs) - added}건 자동 제외)")
+                        st.cache_data.clear()
+                    else:
+                        st.info("전부 중복 — 새로 추가된 거래 없음")
+                except Exception as e:
+                    st.error(f"저장 오류: {e}")
 
 # ── 현대카드 수동 업로드 ──────────────────────────────
 st.markdown("---")

@@ -165,18 +165,26 @@ pip install -r requirements-dev.txt
 python3 -m pytest tests/ -v
 ```
 
-`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 81개 테스트:
+`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 94개 테스트:
 - **test_analysis.py** (13개): _month_pnl·_net_worth_snapshot·detect_outliers·forecast_cash_flow·_normalize_korean_date·_delta·generate_annual_report·build_notification_text·send_slack_notification
 - **test_categorize.py** (14개): guess_category 분기·learn_category_overrides 학습 로직
 - **test_cleanup_summary.py** (5개): 이메일 정리 요약 (카테고리·제목·읽음 처리·길이 절단)
 - **test_email_classifier.py** (17개): 쇼핑/SNS/광고 분류, AliExpress·Amazon, 제목 공백 변형, PG·구독·영수증·고지서 케이스
 - **test_header_decoding.py** (4개): 이메일 Header 객체 안전 디코딩 (.lower() 크래시 방지)
-- **test_input_path.py** (13개): classify_input_path 자동/수동 추론 + 자동↔수동 중복 감지
+- **test_input_path.py** (18개): classify_input_path 명시태그/추론 + 자동↔수동 중복 감지
 - **test_kb_parser.py** (9개): KB국민카드 HTML 명세서 파서 (할부 분담분 정합 포함)
 - **test_loan_parser.py** (6개): 보금자리론 안내 paste 회차 추출
+- **test_unified_inbox.py** (8개): parse_any_file 파일 자동 감지 + BC체크↔IBK echo 탐지
+
+### 📥 통합 업로드 인박스
+대시보드의 `📥 통합 업로드 인박스`에 현대카드·IBK·카카오뱅크 파일을 **구분 없이
+한꺼번에** 올리면: ① 파일 내용으로 기관 자동 감지 → ② 파싱 → ③ 시트 중복 제외 →
+④ BC체크↔IBK echo 의심 거래 표시(기본 제외) → ⑤ 미리보기·수정 → ⑥ 승인 저장.
+카카오뱅크 암호화 파일은 비밀번호 입력란 사용. 월말 결산은 이 인박스 하나로 시작.
 
 ### 데이터 입력 경로 점검
 사이드바 `🔎 입력 경로 점검` expander가 각 행을 **🤖 자동(cron 이메일 명세서)** vs
 **✋ 수동(Excel 업로드)** 으로 분류해 출처별 집계. 같은 거래가 자동·수동 양쪽에
-중복 등록됐는지(예: BC카드 명세서 ↔ IBK 통장 echo)도 감지해 경고. 분류는 `원문`
-컬럼의 고정 prefix(`현대카드 ` `IBK통장|` `카카오뱅크 ` ↔ `월간명세서`)로 추론.
+중복 등록됐는지(예: BC카드 명세서 ↔ IBK 통장 echo)도 감지해 경고. 신규 행은
+`입력경로` 컬럼의 명시 태그(자동:/수동:)로 100% 확정, 마킹 이전 행은 `원문`
+prefix로 추론.
