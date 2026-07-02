@@ -207,6 +207,8 @@ def _infer_input_path(origin: str, source: str) -> str:
     # 출처 fallback
     if src in ("BC카드", "BC카드(신용)", "BC카드(체크)", "KB카드"):
         return f"자동:{src}"
+    if src in ("네이버페이", "토스페이먼츠", "나이스정보통신", "헥토파이낸셜"):
+        return f"자동:{src}"  # PG 알림 — app.py에 업로드 파서 없음, cron으로만 유입
     if src in ("현대카드", "IBK기업은행", "카카오뱅크"):
         return f"수동:{src}"
     return "불명"

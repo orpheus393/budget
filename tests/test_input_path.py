@@ -60,8 +60,14 @@ def test_manual_fallback_by_source_hyundai():
     assert app.classify_input_path("", "현대카드") == "수동"
 
 
+def test_auto_fallback_by_source_pg():
+    # PG(네이버페이 등)는 app.py에 업로드 파서가 없어 cron 이메일로만 유입 → 자동
+    assert app.classify_input_path("", "네이버페이") == "자동"
+    assert app.classify_input_path("", "토스페이먼츠") == "자동"
+
+
 def test_unknown_when_no_signal():
-    assert app.classify_input_path("", "네이버페이") == "불명"
+    assert app.classify_input_path("", "알수없는출처") == "불명"
 
 
 # ── origin prefix가 source fallback보다 우선 ───────────
@@ -115,12 +121,12 @@ def test_breakdown_no_false_duplicate_different_amount():
 def test_breakdown_uses_explicit_column():
     # 입력경로 컬럼이 있으면 원문·출처 추론보다 우선
     df = _build_df([
-        {"날짜": "2026-05-01", "출처": "네이버페이", "유형": "입금", "금액": 5000,
-         "내역": "환급", "카테고리": "수입", "원문": "네이버페이 알림",
-         "입력경로": "자동:네이버페이"},
+        {"날짜": "2026-05-01", "출처": "알수없는출처", "유형": "입금", "금액": 5000,
+         "내역": "환급", "카테고리": "수입", "원문": "정체불명 알림",
+         "입력경로": "자동:알수없는출처"},
     ])
     rows, dups = app._input_path_breakdown(df)
-    assert rows[0]["경로"] == "자동"  # 원문만이면 '불명'인데 명시 태그로 '자동'
+    assert rows[0]["경로"] == "자동"  # 추론만이면 '불명'인데 명시 태그로 '자동'
 
 
 def test_breakdown_empty_df():

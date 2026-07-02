@@ -1445,6 +1445,8 @@ def classify_input_path(origin: str, source: str = "", explicit: str = "") -> st
     src = (source or "").strip()
     if src in ("BC카드", "BC카드(신용)", "BC카드(체크)", "KB카드"):
         return "자동"  # 카드 명세서는 이메일로만 들어옴
+    if src in ("네이버페이", "토스페이먼츠", "나이스정보통신", "헥토파이낸셜"):
+        return "자동"  # PG 결제 알림 — app.py에 업로드 파서가 없어 cron으로만 유입
     if src in ("현대카드", "IBK기업은행", "카카오뱅크"):
         return "수동"  # 실시간 이메일 알림이 없어 Excel 업로드뿐
     return "불명"
