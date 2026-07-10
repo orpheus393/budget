@@ -23,6 +23,9 @@ ENABLE_EMAIL_CLEANUP = os.environ.get("ENABLE_EMAIL_CLEANUP", "").lower() in ("1
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "2"))
 # BC카드 명세서 PDF 비밀번호 (생년월일 6자리). 미설정 시 PDF 파싱 건너뜀.
 BC_PDF_PASSWORD = os.environ.get("BC_PDF_PASSWORD", "")
+# 카카오뱅크 '거래내역 엑셀' 첨부 비밀번호 (생년월일 6자리).
+# 앱 → 거래내역 → 내보내기(이메일)로 받은 암호화 xlsx를 자동 파싱할 때 사용.
+KAKAO_XLSX_PASSWORD = os.environ.get("KAKAO_XLSX_PASSWORD", "")
 # 명세서를 한 번 파싱한 후에도 다음 달까지 LOOKBACK_HOURS 윈도우 밖에 머물 수 있으므로
 # 명세서 메일 검색은 별도로 더 긴 윈도우(기본 35일)를 사용한다.
 STATEMENT_LOOKBACK_DAYS = int(os.environ.get("STATEMENT_LOOKBACK_DAYS", "35"))
@@ -515,6 +518,206 @@ def get_pdf_attachment(msg) -> tuple:
             if payload:
                 return filename, payload
     return None, None
+
+
+def get_xlsx_attachment(msg) -> tuple:
+    """첫 번째 xlsx 첨부의 (파일명, 바이트) 반환"""
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        filename_raw = part.get_filename()
+        filename = decode_str(filename_raw) if filename_raw else ""
+        if filename.lower().endswith(".xlsx"):
+            try:
+                payload = part.get_payload(decode=True)
+            except Exception:
+                payload = None
+            if payload:
+                return filename, payload
+    return None, None
+
+
+def is_kakao_export_email(subject: str) -> bool:
+    """카카오뱅크 '거래내역 엑셀' 내보내기 메일인지 (공백 변형 허용)."""
+    s = re.sub(r"\s+", "", subject or "")
+    return "거래내역엑셀" in s or ("거래내역" in s and "요청하신" in s)
+
+
+def parse_kakao_export_xlsx(xlsx_bytes: bytes, password: str = "") -> list:
+    """카카오뱅크 내보내기 xlsx → 표준 거래 리스트.
+
+    첨부는 보통 생년월일 6자리로 암호화되어 있다 (KAKAO_XLSX_PASSWORD).
+    출력 형식(내역·원문)은 app.py의 수동 업로드 파서와 동일하게 맞춰
+    시트 중복 키(날짜_출처_금액_내역)가 양쪽 경로에서 일치하도록 한다.
+    """
+    import io
+
+    buf = io.BytesIO(xlsx_bytes)
+    try:
+        import msoffcrypto
+        of = msoffcrypto.OfficeFile(buf)
+        if of.is_encrypted():
+            if not password:
+                raise ValueError("암호화 xlsx — KAKAO_XLSX_PASSWORD 시크릿 필요")
+            decrypted = io.BytesIO()
+            of.load_key(password=password)
+            of.decrypt(decrypted)
+            decrypted.seek(0)
+            buf = decrypted
+        else:
+            buf.seek(0)
+    except ImportError:
+        buf.seek(0)
+
+    from openpyxl import load_workbook
+    wb = load_workbook(buf, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    rows = [[c for c in row] for row in ws.iter_rows(values_only=True)]
+    wb.close()
+
+    header_idx = None
+    for i, row in enumerate(rows[:20]):
+        cells = [_norm_header_cell(c) for c in row]
+        if "거래일시" in cells and "거래금액" in cells:
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError("카카오뱅크 xlsx 헤더 행(거래일시+거래금액)을 찾지 못함")
+
+    header = [_norm_header_cell(c) for c in rows[header_idx]]
+
+    def col(*names):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return None
+
+    i_dt = col("거래일시")
+    i_kind = col("구분")
+    i_amt = col("거래금액")
+    i_bal = col("거래후잔액", "잔액")
+    i_txkind = col("거래구분")
+    i_content = col("내용")
+    i_memo = col("메모")
+
+    def _cell(row, idx):
+        if idx is None or idx >= len(row) or row[idx] is None:
+            return ""
+        return str(row[idx]).strip()
+
+    def _to_int(s):
+        s = re.sub(r"[^\d\-]", "", str(s or ""))
+        try:
+            return int(s) if s and s != "-" else 0
+        except ValueError:
+            return 0
+
+    txs = []
+    for row in rows[header_idx + 1:]:
+        raw_dt = row[i_dt] if i_dt is not None and i_dt < len(row) else None
+        if raw_dt is None:
+            continue
+        if isinstance(raw_dt, datetime):
+            dt = raw_dt
+        else:
+            dt = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y.%m.%d %H:%M:%S",
+                        "%Y-%m-%d %H:%M", "%Y.%m.%d %H:%M", "%Y-%m-%d", "%Y.%m.%d"):
+                try:
+                    dt = datetime.strptime(str(raw_dt).strip(), fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
+                continue
+
+        amt_signed = _to_int(_cell(row, i_amt))
+        if amt_signed == 0:
+            continue
+        kind = _cell(row, i_kind)
+        if kind == "출금":
+            tx_type = "출금"
+        elif kind == "입금":
+            tx_type = "입금"
+        else:
+            tx_type = "출금" if amt_signed < 0 else "입금"
+
+        content = _cell(row, i_content)
+        txkind = _cell(row, i_txkind)
+        memo = _cell(row, i_memo)
+        balance = _to_int(_cell(row, i_bal)) if i_bal is not None else ""
+        merchant = (content or txkind or "카카오뱅크 거래")[:50]
+        origin = " | ".join(p for p in ["카카오뱅크", txkind, memo] if p)
+
+        txs.append({
+            "날짜": dt.strftime("%Y-%m-%d"),
+            "시간": dt.strftime("%H:%M"),
+            "출처": "카카오뱅크",
+            "유형": tx_type,
+            "금액": abs(amt_signed),
+            "내역": merchant,
+            "카테고리": guess_category(merchant, tx_type),
+            "원문": origin[:100],
+            "잔액": balance,
+        })
+    return txs
+
+
+def process_kakao_exports(mail, folders: list, dest_folders: dict) -> tuple:
+    """카카오뱅크 '거래내역 엑셀' 내보내기 메일 처리. (transactions, moved) 반환.
+
+    사용자가 카뱅 앱에서 '내보내기 → 이메일'만 누르면 첨부 xlsx를 자동
+    파싱해 시트에 넣는다 — 다운로드·업로드 없이 앱 버튼 하나로 수집 완료.
+    암호 해독 실패(시크릿 미설정 등) 시 INBOX에 남겨 다음 실행에서 재시도.
+    """
+    transactions = []
+    moved = 0
+    since = (datetime.now() - timedelta(days=STATEMENT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+
+    for folder in folders:
+        try:
+            if mail.select(f'"{folder}"', readonly=False)[0] != "OK":
+                continue
+            _, data = mail.search(None, f'(SINCE "{since}" FROM "kakaobank.com")')
+            eids = data[0].split() if data and data[0] else []
+        except Exception as exc:
+            print(f"카뱅 내보내기 검색 실패 ({folder}): {exc}")
+            continue
+
+        for eid in eids:
+            try:
+                _, msg_data = mail.fetch(eid, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_str(msg.get("Subject", ""))
+            except Exception as exc:
+                print(f"카뱅 내보내기 FETCH 실패 (eid={eid}): {exc}")
+                continue
+            if not is_kakao_export_email(subject):
+                continue
+
+            fname, xlsx = get_xlsx_attachment(msg)
+            if not xlsx:
+                print(f"  · 카뱅 내보내기 첨부 없음: {subject[:50]}")
+                continue
+            print(f"  · 카카오뱅크 내보내기 xlsx 파싱 중: ({len(xlsx):,}B)")
+            try:
+                txs = parse_kakao_export_xlsx(xlsx, KAKAO_XLSX_PASSWORD)
+            except Exception as exc:
+                print(f"    → 파싱 실패, INBOX 유지: {exc}")
+                continue
+            if txs:
+                transactions.extend(txs)
+                print(f"    → {len(txs)}건 추출")
+            if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
+                if move_email(mail, eid, dest_folders["처리완료"]):
+                    moved += 1
+
+        if ENABLE_EMAIL_CLEANUP:
+            try:
+                mail.expunge()
+            except Exception:
+                pass
+    return transactions, moved
 
 
 def _norm_header_cell(s) -> str:
@@ -1848,6 +2051,15 @@ def main():
         total_moved["KB명세서"] = kb_moved
     except Exception as exc:
         print(f"KB 명세서 처리 실패: {exc}")
+
+    # 카카오뱅크 '거래내역 엑셀' 내보내기 별도 패스
+    # 사용자가 앱에서 '내보내기 → 이메일'만 누르면 첨부를 자동 수집.
+    try:
+        kk_txs, kk_moved = process_kakao_exports(mail, IMAP_FOLDERS, dest_folders)
+        all_transactions.extend(kk_txs)
+        total_moved["카뱅내보내기"] = kk_moved
+    except Exception as exc:
+        print(f"카뱅 내보내기 처리 실패: {exc}")
 
     # 주택금융공사 보금자리론 안내 — 회차 정보를 보금자리론 워크시트에 자동 누적
     try:
