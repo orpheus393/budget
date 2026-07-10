@@ -52,6 +52,7 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           BC_PDF_PASSWORD: ${{ secrets.BC_PDF_PASSWORD }}
+          KAKAO_XLSX_PASSWORD: ${{ secrets.KAKAO_XLSX_PASSWORD }}
           ENABLE_EMAIL_CLEANUP: "true"
           LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '26' }}
           STATEMENT_LOOKBACK_DAYS: "35"

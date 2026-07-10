@@ -5,11 +5,12 @@
 GitHub Actions (1일 1회, 09:00 KST)
     → 네이버 이메일 파싱
         · 월간 카드 명세서 자동 수집: BC카드 PDF, KB국민카드 HTML
+        · 카카오뱅크 '거래내역 엑셀' 내보내기 첨부 자동 수집
         · 보금자리론 안내, (도착 시) 은행 통지 메일
     → Google Sheets 저장
           ↓
-사용자 수동 업로드 (대시보드)
-    · 현대카드 Excel, 카카오뱅크/IBK 거래내역 Excel
+사용자 수동 업로드 (대시보드 통합 인박스)
+    · 현대카드 Excel, IBK 거래내역 Excel (+ 카뱅 파일 직접 업로드도 가능)
     → Google Sheets 저장
           ↓
 Streamlit Cloud (대시보드)
@@ -44,6 +45,9 @@ repo → Settings → Secrets and variables → Actions:
 - `GOOGLE_CREDS_JSON`: 서비스 계정 JSON 전체 내용
 - `BC_PDF_PASSWORD` (선택): BC카드 월간 명세서 PDF 비밀번호 (생년월일 6자리, 예: `900101`).
   설정하면 매월 도착하는 `이용대금명세서` PDF를 자동 복호화·파싱해서 시트에 추가합니다.
+- `KAKAO_XLSX_PASSWORD` (선택): 카카오뱅크 '거래내역 엑셀' 첨부 비밀번호 (생년월일 6자리).
+  설정하면 카뱅 앱 → 거래내역 → **내보내기(이메일)** 로 보낸 xlsx를 cron이 자동
+  복호화·파싱해서 시트에 추가 — 다운로드·업로드 없이 앱 버튼 하나로 수집 완료.
 - `SLACK_WEBHOOK_URL` (선택): 슬랙 알림 + **cron 실패 시 자동 슬랙 알림**.
 - `OWNER_NAME` (선택, 기본 `임영재`): 본인 명의 계좌 예금주명. 거래 내역의 '내역'에 이 이름이 있으면 농협→어머니차입금, 카뱅·토스→자기이체로 자동 분기. 다른 사용자가 쓸 때 자기 이름으로 변경.
 
@@ -109,6 +113,19 @@ KB국민카드는 모바일 앱에서 거래내역 다운로드를 지원하지 
 - 할부 거래는 td8(이번달 분담분)을 사용해 IBK의 KB카드 자동이체 금액과 정합 (td5는 전체 이용금액)
 - 청구월 정보(결제년월일)는 각 행의 `원문` 컬럼에 기록 → 카드 청구 ↔ 사용 매칭 활용
 
+## 카카오뱅크 '거래내역 엑셀' 이메일 자동 수집
+카카오뱅크는 실시간 알림 메일이 없지만, 앱에서 거래내역을 **이메일로 내보내기**할 수 있습니다.
+
+### 사용자 할 일 (매달 앱 버튼 하나)
+1. 카카오뱅크 앱 → 해당 계좌 → 거래내역 → **내보내기 → 이메일** (수신: `NAVER_EMAIL` 주소)
+2. 끝. 다운로드도 업로드도 필요 없음.
+
+### 시스템 동작
+- 발신 `no-reply@mail.kakaobank.com`, 제목 `...요청하신 거래내역 엑셀파일입니다` 메일을 cron이 감지
+- 첨부 xlsx를 `KAKAO_XLSX_PASSWORD`(생년월일 6자리)로 복호화 → 파싱 → 시트 저장 (`입력경로 자동:카카오뱅크`)
+- 내역·원문 형식이 대시보드 수동 업로드 파서와 동일 → 기간이 겹쳐도 중복 자동 제외
+- 복호화 실패(시크릿 미설정 등) 시 INBOX에 남겨 다음 실행에서 재시도, 성공 시 처리완료 폴더로 이동
+
 ## 회계 분석 기능
 
 ### 시트 스키마 (자동 마이그레이션)
@@ -165,7 +182,7 @@ pip install -r requirements-dev.txt
 python3 -m pytest tests/ -v
 ```
 
-`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 94개 테스트:
+`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 101개 테스트:
 - **test_analysis.py** (13개): _month_pnl·_net_worth_snapshot·detect_outliers·forecast_cash_flow·_normalize_korean_date·_delta·generate_annual_report·build_notification_text·send_slack_notification
 - **test_categorize.py** (14개): guess_category 분기·learn_category_overrides 학습 로직
 - **test_cleanup_summary.py** (5개): 이메일 정리 요약 (카테고리·제목·읽음 처리·길이 절단)
@@ -175,6 +192,7 @@ python3 -m pytest tests/ -v
 - **test_kb_parser.py** (9개): KB국민카드 HTML 명세서 파서 (할부 분담분 정합 포함)
 - **test_loan_parser.py** (6개): 보금자리론 안내 paste 회차 추출
 - **test_unified_inbox.py** (8개): parse_any_file 파일 자동 감지 + BC체크↔IBK echo 탐지
+- **test_kakao_export.py** (7개): 카뱅 '내보내기 이메일' 제목 매칭·xlsx 파싱·첨부 추출
 
 ### 📥 통합 업로드 인박스
 대시보드의 `📥 통합 업로드 인박스`에 현대카드·IBK·카카오뱅크 파일을 **구분 없이
