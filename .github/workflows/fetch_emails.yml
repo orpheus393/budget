@@ -13,6 +13,10 @@ on:
         description: '검색 기간 (시간). 1일 1회 cron 기준 기본 26시간. 누적 메일 일회 정리 시 720(30일) 권장'
         required: false
         default: '26'
+      kakao_password:
+        description: '카뱅 xlsx 비밀번호 (일회용 대체). KAKAO_XLSX_PASSWORD 시크릿이 등록되면 불필요 — 시크릿이 항상 우선'
+        required: false
+        default: ''
 
 jobs:
   fetch:
@@ -45,6 +49,15 @@ jobs:
       - name: 파서 단위 테스트
         run: python scripts/test_email_parser.py
 
+      - name: 일회용 비밀번호 마스킹
+        # kakao_password 입력값이 이후 스텝의 env 헤더·로그에 평문 노출되지
+        # 않게 먼저 마스킹. 값을 셸 표현식으로 전개하면 run 커맨드 에코에
+        # 노출되므로 이벤트 JSON 파일에서 직접 읽는다.
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          pw=$(jq -r '.inputs.kakao_password // empty' "$GITHUB_EVENT_PATH")
+          if [ -n "$pw" ]; then echo "::add-mask::$pw"; fi
+
       - name: 이메일 파싱 실행
         env:
           NAVER_EMAIL: ${{ secrets.NAVER_EMAIL }}
@@ -52,7 +65,7 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           BC_PDF_PASSWORD: ${{ secrets.BC_PDF_PASSWORD }}
-          KAKAO_XLSX_PASSWORD: ${{ secrets.KAKAO_XLSX_PASSWORD }}
+          KAKAO_XLSX_PASSWORD: ${{ secrets.KAKAO_XLSX_PASSWORD || github.event.inputs.kakao_password }}
           ENABLE_EMAIL_CLEANUP: "true"
           LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '26' }}
           STATEMENT_LOOKBACK_DAYS: "35"
