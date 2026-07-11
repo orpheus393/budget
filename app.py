@@ -217,12 +217,34 @@ SCOPES = [
 SHEET_HEADER = ["날짜", "시간", "출처", "유형", "금액", "내역", "카테고리", "원문", "잔액", "입력경로"]
 
 
-def get_worksheet():
+def _open_workbook():
+    """스토리지 백엔드 선택.
+
+    secrets.toml에 STORAGE = "sqlite" 가 있으면 PC의 SQLite 파일
+    (DB_PATH, 기본 data/budget.db)을 열고, 없으면 기존 Google Sheets.
+    localdb.LocalWorkbook은 gspread API 표면을 그대로 제공하므로
+    이 함수 아래의 모든 코드는 백엔드를 구분하지 않는다.
+    """
+    try:
+        storage = str(st.secrets.get("STORAGE", "sheets")).lower()
+    except Exception:
+        storage = "sheets"
+    if storage == "sqlite":
+        from localdb import open_workbook
+        try:
+            db_path = str(st.secrets.get("DB_PATH", "data/budget.db"))
+        except Exception:
+            db_path = "data/budget.db"
+        return open_workbook(db_path)
     creds_dict = dict(st.secrets["gcp_service_account"])
     sheet_id = st.secrets["GOOGLE_SHEET_ID"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     gc = gspread.authorize(creds)
-    sheet = gc.open_by_key(sheet_id)
+    return gc.open_by_key(sheet_id)
+
+
+def get_worksheet():
+    sheet = _open_workbook()
     try:
         ws = sheet.worksheet("거래내역")
     except gspread.WorksheetNotFound:

@@ -1857,22 +1857,8 @@ def process_hf_loan_emails(mail, folders: list, dest_folders: dict) -> int:
             # lazy load 보금자리론 워크시트
             if loan_ws is None:
                 try:
-                    import json
-                    import tempfile
                     import gspread
-                    from google.oauth2.service_account import Credentials
-                    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-                        json.dump(creds_dict, f)
-                        creds_path = f.name
-                    scopes = [
-                        "https://spreadsheets.google.com/feeds",
-                        "https://www.googleapis.com/auth/drive",
-                    ]
-                    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-                    gc = gspread.authorize(creds)
-                    os.unlink(creds_path)
-                    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+                    sh = _open_workbook_backend()
                     try:
                         loan_ws = sh.worksheet("보금자리론")
                     except gspread.WorksheetNotFound:
@@ -1913,10 +1899,25 @@ def process_hf_loan_emails(mail, folders: list, dest_folders: dict) -> int:
 
 
 # ── Google Sheets 저장 ────────────────────────────────
-def save_to_sheets(transactions: list):
+def _open_workbook_backend():
+    """저장 백엔드 선택: STORAGE=sqlite면 로컬 SQLite, 아니면 Google Sheets.
+
+    로컬 모드에서는 PC의 data/budget.db 파일에 직접 기록 —
+    localdb.LocalWorkbook이 gspread API 표면을 그대로 제공하므로
+    호출부(save_to_sheets, 보금자리론)는 백엔드를 구분하지 않는다.
+    """
+    if os.environ.get("STORAGE", "").lower() == "sqlite":
+        import sys
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from localdb import open_workbook
+        return open_workbook(
+            os.environ.get("DB_PATH", os.path.join(repo_root, "data", "budget.db"))
+        )
+
     import json
     import tempfile
-
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -1924,7 +1925,6 @@ def save_to_sheets(transactions: list):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(creds_dict, f)
         creds_path = f.name
-
     scopes = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
@@ -1932,9 +1932,14 @@ def save_to_sheets(transactions: list):
     creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
     gc = gspread.authorize(creds)
     os.unlink(creds_path)
+    return gc.open_by_key(GOOGLE_SHEET_ID)
 
-    sheet = gc.open_by_key(GOOGLE_SHEET_ID)
-    print(f"📊 Google Sheet: {sheet.title} → {sheet.url}")
+
+def save_to_sheets(transactions: list):
+    import gspread
+
+    sheet = _open_workbook_backend()
+    print(f"📊 저장소: {sheet.title} → {sheet.url}")
 
     if not transactions:
         print("새로운 거래 없음")
