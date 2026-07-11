@@ -1,5 +1,8 @@
 # 💰 가계부 자동화
 
+> 💻 **PC에서 전부 로컬로 돌리고 싶다면** (Google Sheets → SQLite, 클라우드 의존 제거):
+> [README-LOCAL.md](README-LOCAL.md) 참고. `secrets.toml`에 `STORAGE = "sqlite"` 한 줄로 전환.
+
 ## 구조
 ```
 GitHub Actions (1일 1회, 09:00 KST)
@@ -182,7 +185,7 @@ pip install -r requirements-dev.txt
 python3 -m pytest tests/ -v
 ```
 
-`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 101개 테스트:
+`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 112개 테스트:
 - **test_analysis.py** (13개): _month_pnl·_net_worth_snapshot·detect_outliers·forecast_cash_flow·_normalize_korean_date·_delta·generate_annual_report·build_notification_text·send_slack_notification
 - **test_categorize.py** (14개): guess_category 분기·learn_category_overrides 학습 로직
 - **test_cleanup_summary.py** (5개): 이메일 정리 요약 (카테고리·제목·읽음 처리·길이 절단)
@@ -193,6 +196,7 @@ python3 -m pytest tests/ -v
 - **test_loan_parser.py** (6개): 보금자리론 안내 paste 회차 추출
 - **test_unified_inbox.py** (8개): parse_any_file 파일 자동 감지 + BC체크↔IBK echo 탐지
 - **test_kakao_export.py** (7개): 카뱅 '내보내기 이메일' 제목 매칭·xlsx 파싱·첨부 추출
+- **test_localdb.py** (11개): SQLite 로컬 스토리지 gspread 호환 어댑터 + 로컬 저장 통합
 
 ### 📥 통합 업로드 인박스
 대시보드의 `📥 통합 업로드 인박스`에 현대카드·IBK·카카오뱅크 파일을 **구분 없이
