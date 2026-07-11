@@ -1943,7 +1943,7 @@ def save_to_sheets(transactions: list):
 
     if not transactions:
         print("새로운 거래 없음")
-        return
+        return 0
 
     # 시트 스키마: 날짜·시간·출처·유형·금액·내역·카테고리·원문·잔액·입력경로 (10열)
     # 대시보드(app.py)와 동일한 컬럼 순서로 써야 컬럼이 어긋나지 않음.
@@ -1981,6 +1981,56 @@ def save_to_sheets(transactions: list):
         print(f"✅ {len(new_rows)}개 거래 저장 완료")
     else:
         print("중복 없음, 새 거래 없음")
+    return len(new_rows)
+
+
+def build_summary_email(saved_count: int, total_moved: dict,
+                        parsed_count: int = 0) -> tuple:
+    """수집 결과 발신용 (제목, 본문). 알릴 게 없으면 (None, None).
+
+    '조용한 성공-실패' 방지가 목적 — 명세서·카뱅 내보내기 같은 월 1회
+    이벤트가 처리됐을 때만 보내므로 월 몇 통 수준. 매일 빈 결과까지
+    보내 소음이 되지 않게 저장 0건 + 이벤트 0건이면 안 보낸다.
+    """
+    events = {k: v for k, v in (total_moved or {}).items()
+              if v and k in ("명세서", "KB명세서", "카뱅내보내기", "보금자리론")}
+    if saved_count <= 0 and not events:
+        return None, None
+
+    lines = [f"저장된 거래: {saved_count}건 (파싱 {parsed_count}건, 중복 제외 후)"]
+    label = {"명세서": "BC카드 명세서", "KB명세서": "KB카드 명세서",
+             "카뱅내보내기": "카카오뱅크 내보내기", "보금자리론": "보금자리론 회차"}
+    for k, v in events.items():
+        lines.append(f"· {label.get(k, k)}: {v}건 처리")
+    if parsed_count > 0 and saved_count == 0:
+        lines.append("⚠️ 파싱은 됐지만 전부 중복 — 이미 시트에 있는 데이터")
+    lines.append("")
+    lines.append("대시보드에서 확인 후 카테고리가 '기타'인 거래를 정리해 주세요.")
+
+    subject = f"[가계부] 수집 결과: {saved_count}건 저장 ({datetime.now():%m/%d})"
+    return subject, "\n".join(lines)
+
+
+def send_summary_email(subject: str, body: str) -> bool:
+    """네이버 SMTP로 요약 발신 (수신: 본인, SUMMARY_EMAIL_TO로 변경 가능).
+
+    IMAP과 같은 NAVER_EMAIL/NAVER_APP_PW를 쓰므로 추가 시크릿 불필요.
+    발신 실패는 수집을 깨면 안 되므로 호출부에서 예외를 삼킨다.
+    """
+    import smtplib
+    from email.mime.text import MIMEText
+
+    to_addr = os.environ.get("SUMMARY_EMAIL_TO", "").strip() or NAVER_EMAIL
+    msg = MIMEText(body, _charset="utf-8")
+    msg["Subject"] = subject
+    msg["From"] = NAVER_EMAIL
+    msg["To"] = to_addr
+    with smtplib.SMTP("smtp.naver.com", 587, timeout=30) as smtp:
+        smtp.starttls()
+        smtp.login(NAVER_EMAIL, NAVER_APP_PW)
+        smtp.send_message(msg)
+    print(f"📧 요약 메일 발신 → {to_addr}")
+    return True
 
 
 def build_cleanup_summary(cleanup_log: dict, total_moved: dict) -> str:
@@ -2086,7 +2136,19 @@ def main():
     except Exception:
         pass
 
-    save_to_sheets(all_transactions)
+    saved = save_to_sheets(all_transactions) or 0
+
+    # SMTP 요약 발신 — 저장/명세서 이벤트가 있을 때만 (월 몇 통 수준).
+    # EMAIL_SUMMARY=false로 끌 수 있고, 발신 실패는 수집 결과에 영향 없음.
+    if os.environ.get("EMAIL_SUMMARY", "true").lower() not in ("false", "0", "no"):
+        try:
+            subject, body = build_summary_email(
+                saved, total_moved, parsed_count=len(all_transactions))
+            if subject:
+                send_summary_email(subject, body)
+        except Exception as exc:
+            print(f"요약 메일 발신 실패 (수집은 정상): {exc}")
+
     print("완료!")
 
 

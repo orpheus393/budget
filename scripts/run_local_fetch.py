@@ -43,6 +43,7 @@ def main():
     env["DB_PATH"] = str(secrets.get(
         "DB_PATH", os.path.join(REPO_ROOT, "data", "budget.db")))
     env["ENABLE_EMAIL_CLEANUP"] = str(secrets.get("ENABLE_EMAIL_CLEANUP", "true"))
+    env["EMAIL_SUMMARY"] = str(secrets.get("EMAIL_SUMMARY", "true"))
     env["LOOKBACK_HOURS"] = sys.argv[1] if len(sys.argv) > 1 else "26"
     env["STATEMENT_LOOKBACK_DAYS"] = "35"
 

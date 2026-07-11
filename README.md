@@ -129,6 +129,14 @@ KB국민카드는 모바일 앱에서 거래내역 다운로드를 지원하지 
 - 내역·원문 형식이 대시보드 수동 업로드 파서와 동일 → 기간이 겹쳐도 중복 자동 제외
 - 복호화 실패(시크릿 미설정 등) 시 INBOX에 남겨 다음 실행에서 재시도, 성공 시 처리완료 폴더로 이동
 
+## 수집 결과 SMTP 요약 메일
+수집(cron 또는 로컬)이 **거래를 저장했거나 명세서·카뱅 내보내기를 처리했을 때만**
+네이버 SMTP로 본인에게 요약을 발신합니다 (월 몇 통 수준 — 매일 빈 결과는 안 보냄).
+- 추가 시크릿 불필요: IMAP과 같은 `NAVER_EMAIL`/`NAVER_APP_PW` 사용 (smtp.naver.com:587)
+- 명세서를 처리했는데 전부 중복이면 ⚠️ 표시 — '조용한 성공-실패' 방지
+- 끄기: env `EMAIL_SUMMARY=false` · 수신 변경: `SUMMARY_EMAIL_TO`
+- 발신 실패는 수집 결과에 영향 없음
+
 ## 회계 분석 기능
 
 ### 시트 스키마 (자동 마이그레이션)
@@ -185,7 +193,7 @@ pip install -r requirements-dev.txt
 python3 -m pytest tests/ -v
 ```
 
-`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 112개 테스트:
+`tests/conftest.py`가 streamlit·gspread·plotly를 mock해 외부 서비스 없이 함수 단위 검증. 현재 117개 테스트:
 - **test_analysis.py** (13개): _month_pnl·_net_worth_snapshot·detect_outliers·forecast_cash_flow·_normalize_korean_date·_delta·generate_annual_report·build_notification_text·send_slack_notification
 - **test_categorize.py** (14개): guess_category 분기·learn_category_overrides 학습 로직
 - **test_cleanup_summary.py** (5개): 이메일 정리 요약 (카테고리·제목·읽음 처리·길이 절단)
@@ -197,6 +205,7 @@ python3 -m pytest tests/ -v
 - **test_unified_inbox.py** (8개): parse_any_file 파일 자동 감지 + BC체크↔IBK echo 탐지
 - **test_kakao_export.py** (7개): 카뱅 '내보내기 이메일' 제목 매칭·xlsx 파싱·첨부 추출
 - **test_localdb.py** (11개): SQLite 로컬 스토리지 gspread 호환 어댑터 + 로컬 저장 통합
+- **test_summary_email.py** (5개): SMTP 수집 요약 발신 조건 (소음 방지·중복 경고)
 
 ### 📥 통합 업로드 인박스
 대시보드의 `📥 통합 업로드 인박스`에 현대카드·IBK·카카오뱅크 파일을 **구분 없이
