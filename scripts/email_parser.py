@@ -389,15 +389,15 @@ def is_statement_email(subject: str) -> bool:
     # 명세서 안내 / 수령방법 변경 안내성 메일은 제외
     if any(x in subject for x in ("수령방법", "신청완료", "이메일로 신청", "안내드립니다")):
         return False
-    return (
-        "이용대금명세서" in subject
-        or "이용대금 명세서" in subject
-        or "이메일명세서" in subject
-        or "e-메일명세서" in subject
-        or "이용대금" in subject
-        or "명세서 재발송" in subject
-        or "명세서가 도착" in subject
-    )
+    # 공백을 지운 정규화 문자열로 비교 — 카드사마다 띄어쓰기가 다르다
+    # ('이메일 명세서'=현대카드, '이메일명세서'=KB, '이용대금 명세서'=BC).
+    norm = re.sub(r"\s+", "", subject)
+    if any(k in norm for k in ("이용대금명세서", "이메일명세서", "e-메일명세서",
+                               "이용대금", "명세서재발송", "명세서가도착")):
+        return True
+    # 월별 정기 명세서: '2026년07월 명세서', '2026년07월15일 명세서'.
+    # KB가 '재발송' 없는 이 형식으로 보내기 시작해 7월분이 누락됐다.
+    return bool(re.search(r"\d{4}년\s*\d{1,2}월(?:\s*\d{1,2}일)?.{0,12}명세서", norm))
 
 
 def parse_kb_email_html(html_text: str) -> list[dict]:
