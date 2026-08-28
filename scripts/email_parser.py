@@ -11,6 +11,13 @@ import html as html_module
 import imaplib
 import os
 import re
+import sys
+
+# 업로드 파서(upload_parsers.py)는 저장소 루트에 있다. `python scripts/email_parser.py`로
+# 실행하면 sys.path[0]이 scripts/라서 루트가 잡히지 않으므로 직접 넣어준다.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from datetime import datetime, timedelta
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
@@ -710,6 +717,120 @@ def process_kakao_exports(mail, folders: list, dest_folders: dict) -> tuple:
                 transactions.extend(txs)
                 print(f"    → {len(txs)}건 추출")
             if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
+                if move_email(mail, eid, dest_folders["처리완료"]):
+                    moved += 1
+
+        if ENABLE_EMAIL_CLEANUP:
+            try:
+                mail.expunge()
+            except Exception:
+                pass
+    return transactions, moved
+
+
+_UPLOAD_EXTS = (".xls", ".xlsx", ".csv", ".htm", ".html")
+
+
+def iter_upload_attachments(msg):
+    """메일 첨부 중 거래내역 파일일 수 있는 것만 (파일명, 바이트)로 내놓는다."""
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        raw_name = part.get_filename()
+        if not raw_name:
+            continue
+        name = decode_str(raw_name)
+        if not name.lower().endswith(_UPLOAD_EXTS):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if payload:
+            yield name, payload
+
+
+def dataframe_to_transactions(df, source: str, filename: str) -> list:
+    """업로드 파서가 낸 DataFrame → save_to_sheets가 받는 거래 dict 리스트."""
+    txs = []
+    for _, row in df.iterrows():
+        amount = row.get("금액", 0)
+        try:
+            amount = int(float(amount))
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        txs.append({
+            "날짜": str(row.get("날짜", "")),
+            "시간": str(row.get("시간", "") or ""),
+            "출처": str(row.get("출처", "") or source),
+            "유형": str(row.get("유형", "") or "출금"),
+            "금액": amount,
+            "내역": str(row.get("내역", "") or "")[:50],
+            "카테고리": str(row.get("카테고리", "") or "기타"),
+            "원문": str(row.get("원문", "") or f"{source} 메일첨부") + f" | {filename}",
+            "잔액": str(row.get("잔액", "") or ""),
+            # 대시보드 업로드('수동:')와 구분 — 메일만 보내면 끝나는 경로.
+            "입력경로": f"자동:메일첨부:{source}",
+        })
+    return txs
+
+
+def process_self_uploads(mail, folders: list, dest_folders: dict) -> tuple:
+    """내가 나에게 보낸 메일의 첨부를 자동 적재. (transactions, moved) 반환.
+
+    현대카드·IBK기업은행은 건별 알림 메일이 없어 사이트에서 파일을 받아야만
+    한다. 지금까지는 그 파일을 대시보드에 업로드해야 했지만(입력경로 '수동:'),
+    이 패스가 있으면 **받은 파일을 자기 메일로 보내기만 하면** 끝난다.
+    폰에서 받은 첨부도 전달 한 번이면 되고 Streamlit을 띄울 필요가 없다.
+
+    파서는 app.py와 같은 upload_parsers.parse_any_file — 파일 '내용'으로 기관을
+    감지하므로 제목·파일명 규칙이 필요 없다. 인식 못 한 첨부는 조용히 건너뛰고
+    메일도 그대로 둬서(이동 안 함) 다음 실행에 재시도한다.
+    """
+    from upload_parsers import parse_any_file
+
+    transactions = []
+    moved = 0
+    if not NAVER_EMAIL:
+        return transactions, moved
+    since = (datetime.now() - timedelta(days=STATEMENT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+
+    for folder in folders:
+        try:
+            if mail.select(f'"{folder}"', readonly=False)[0] != "OK":
+                continue
+            _, data = mail.search(None, f'(SINCE "{since}" FROM "{NAVER_EMAIL}")')
+            eids = data[0].split() if data and data[0] else []
+        except Exception as exc:
+            print(f"셀프 업로드 검색 실패 ({folder}): {exc}")
+            continue
+
+        for eid in eids:
+            try:
+                _, msg_data = mail.fetch(eid, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_str(msg.get("Subject", ""))
+            except Exception as exc:
+                print(f"셀프 업로드 FETCH 실패 (eid={eid}): {exc}")
+                continue
+
+            parsed_any = False
+            for fname, raw in iter_upload_attachments(msg):
+                try:
+                    source, df = parse_any_file(fname, raw, password=KAKAO_XLSX_PASSWORD)
+                except Exception as exc:
+                    print(f"  · 첨부 인식 실패, 건너뜀: {fname} ({exc})")
+                    continue
+                txs = dataframe_to_transactions(df, source, fname)
+                if txs:
+                    transactions.extend(txs)
+                    parsed_any = True
+                    print(f"  · 셀프 업로드 [{source}] {fname}: {len(txs)}건 추출")
+
+            # 한 건이라도 적재된 메일만 치운다 — 실패분은 남겨 재시도.
+            if parsed_any and ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
                 if move_email(mail, eid, dest_folders["처리완료"]):
                     moved += 1
 
@@ -2174,6 +2295,16 @@ def main():
         total_moved["카뱅내보내기"] = kk_moved
     except Exception as exc:
         print(f"카뱅 내보내기 처리 실패: {exc}")
+
+    # 셀프 업로드 — 내가 나에게 보낸 메일의 첨부(현대카드·IBK·카뱅 거래내역).
+    # 이 두 곳은 건별 알림 메일이 없어 파일을 받아야만 하는데, 대시보드를
+    # 띄우는 대신 메일로 보내기만 하면 여기서 자동 적재된다.
+    try:
+        up_txs, up_moved = process_self_uploads(mail, IMAP_FOLDERS, dest_folders)
+        all_transactions.extend(up_txs)
+        total_moved["셀프업로드"] = up_moved
+    except Exception as exc:
+        print(f"셀프 업로드 처리 실패: {exc}")
 
     # 주택금융공사 보금자리론 안내 — 회차 정보를 보금자리론 워크시트에 자동 누적
     try:
