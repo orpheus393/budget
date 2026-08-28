@@ -5,6 +5,7 @@ email_parser.py
 """
 
 import base64
+import difflib
 import email
 import html as html_module
 import imaplib
@@ -1388,15 +1389,73 @@ def parse_pdf_transactions(pdf_bytes: bytes, password: str,
     return _dedup_pdf_transactions(plumber_txs or pymupdf_txs)
 
 
+# BC카드 월간명세서는 온누리상품권·정부지원금 결제를 "라벨+가맹점" 줄과
+# "가맹점만" 줄로 두 번 적는다. 그대로 파싱하면 같은 거래가 2건이 되어
+# 지출이 이중 계상된다 (2026-05~08 실제 17쌍 289,610원 과다).
+# OCR 오독까지 감안해 글자 사이 공백·누락을 허용하는 느슨한 패턴으로 떼어낸다.
+_PAYMENT_LABEL_RE = re.compile(
+    r"(?:온\s*누\s*리?\s*(?:전\s*자\s*(?:상\s*품\s*권|민)?|자\s*동)?\s*(?:충\s*전)?"
+    r"|고\s*유\s*가\s*피\s*해\s*지\s*원\s*금?)"
+)
+
+
+def strip_payment_label(merchant: str) -> str:
+    """가맹점명에 붙은 결제프로그램 라벨 제거. 라벨뿐이면 원본을 지킨다."""
+    if not merchant:
+        return ""
+    stripped = _PAYMENT_LABEL_RE.sub(" ", merchant)
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ._#|-")
+    return stripped or merchant.strip()
+
+
+def _merchant_fingerprint(merchant: str) -> str:
+    """중복 판정용 지문 — 라벨·구두점·숫자 제거."""
+    return re.sub(r"[\s_.#()|@0-9-]", "", strip_payment_label(merchant))
+
+
+def _merchant_noise(merchant: str) -> tuple:
+    """작을수록 좋은 이름. 라벨은 어차피 떼고 저장하므로 **뗀 뒤의 이름**으로
+    판정한다 — 라벨 붙은 줄이 오히려 가맹점명은 멀쩡한 경우가 있다
+    (예: `_7@0 알찬농산` vs `온누리전자상품권 _ 알찬농산`).
+
+    (OCR 잡음문자 수, 라벨 있었는지, 길이 역순)
+    """
+    m = merchant or ""
+    stripped = strip_payment_label(m)
+    return (len(re.findall(r"[_@#|]", stripped)),
+            1 if _PAYMENT_LABEL_RE.search(m) else 0,
+            -len(stripped))
+
+
 def _dedup_pdf_transactions(txs: list) -> list:
-    seen = set()
+    """PDF 파싱 결과 중복 제거.
+
+    완전 일치뿐 아니라 '같은 날·같은 금액인데 가맹점명만 라벨/OCR 차이'인
+    쌍도 하나로 접는다. 남기는 쪽은 라벨이 없고 잡음이 적은 이름.
+    """
     out = []
+    buckets = {}  # (날짜, 금액) -> out 인덱스 목록
     for tx in txs:
-        key = (tx["날짜"], tx["내역"], tx["금액"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(tx)
+        fp = _merchant_fingerprint(tx["내역"])
+        bucket = buckets.setdefault((tx["날짜"], tx["금액"]), [])
+        dup_idx = None
+        for i in bucket:
+            other = _merchant_fingerprint(out[i]["내역"])
+            if not fp or not other:
+                continue
+            if (fp == other or fp in other or other in fp
+                    or difflib.SequenceMatcher(None, fp, other).ratio() >= 0.7):
+                dup_idx = i
+                break
+        if dup_idx is None:
+            bucket.append(len(out))
+            out.append(tx)
+        elif _merchant_noise(tx["내역"]) < _merchant_noise(out[dup_idx]["내역"]):
+            out[dup_idx] = tx  # 더 깨끗한 이름 쪽으로 교체
+
+    # 살아남은 건 라벨을 떼고 저장 — 라벨 줄만 있는 거래도 이름이 깔끔해진다.
+    for tx in out:
+        tx["내역"] = strip_payment_label(tx["내역"])[:50] or tx["내역"]
     return out
 
 
