@@ -1,13 +1,13 @@
 name: 가계부 이메일 자동 수집
 
+# ⚠️ 정기 수집(cron)은 2026-09 로컬 모드 전환과 함께 제거했다.
+# 수집은 PC에서 실행한다 (scripts/run_local_fetch.py + Windows 작업 스케줄러,
+# README-LOCAL.md 참고). 클라우드와 PC가 동시에 돌면 먼저 처리한 쪽이 메일을
+# '처리완료'로 옮겨버려 다른 쪽은 그 거래를 영영 못 본다 — 실제로 8월에
+# 클라우드가 가져간 거래가 구글 시트에만 남았다 (scripts/sync_sheet_to_local.py로 회수).
+# 아래 수동 실행은 PC를 못 쓸 때를 위한 비상용으로만 남겨둔다.
 on:
-  schedule:
-    # 1일 1회 (00:00 UTC = 09:00 KST). 한국 은행·카드사는 실시간 입출금/결제
-    # 알림을 이메일로 보내지 않음 (앱푸시·카톡·SMS만). 이메일로 실제 오는 건
-    # 월 1회 카드 명세서(BC PDF, KB HTML)뿐 — STATEMENT_LOOKBACK_DAYS=35라
-    # 하루 1회로도 놓치지 않음. 매시간 cron은 가져올 게 없어 낭비였음.
-    - cron: '0 0 * * *'
-  workflow_dispatch:       # 수동 실행 버튼
+  workflow_dispatch:       # 수동 실행 버튼 (비상용)
     inputs:
       lookback_hours:
         description: '검색 기간 (시간). 1일 1회 cron 기준 기본 26시간. 누적 메일 일회 정리 시 720(30일) 권장'
