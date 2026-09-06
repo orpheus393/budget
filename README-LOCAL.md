@@ -59,6 +59,11 @@ streamlit run app.py
 python scripts\run_local_fetch.py        # 최근 26시간
 python scripts\run_local_fetch.py 720    # 밀린 30일치 일회 수집
 ```
+메일 구조 확인 (새 카드사 파서 만들 때):
+```powershell
+python scripts\run_local_inspect.py hyundaicard 40 2
+```
+
 매일 09:00 자동 실행 등록 (관리자 PowerShell):
 ```powershell
 schtasks /create /tn "가계부수집" /sc daily /st 09:00 `
@@ -70,10 +75,23 @@ PC가 꺼져 있던 날은 다음 실행이 26시간+35일(명세서) lookback�
 가계부 전체 = `data\budget.db` 파일 하나. 주기적으로 복사하거나,
 `DB_PATH`를 OneDrive/Google Drive 동기화 폴더로 지정하면 자동 백업됩니다.
 
-## 8. 클라우드 정리 (로컬이 안정된 뒤)
-- GitHub Actions cron 끄기: `fetch_emails.yml`의 `schedule` 블록 삭제 (또는 repo Settings → Actions disable)
-- Streamlit Cloud 앱 삭제 (선택)
-- Google Sheets는 백업본으로 그냥 둬도 무방
+## 7-1. 클라우드가 가져간 거래 회수 (전환 직후 1회)
+
+로컬 전환 뒤에도 클라우드 cron이 계속 돌면 **먼저 처리한 쪽이 메일을
+'처리완료'로 옮겨버려** 다른 쪽은 그 거래를 영영 못 본다. 실제로 2026년 8월
+클라우드가 가져간 거래가 구글 시트에만 남았다. 아래로 회수한다:
+
+```powershell
+python scripts\sync_sheet_to_local.py 2026-07-29 --dry-run   # 몇 건인지 먼저 확인
+python scripts\sync_sheet_to_local.py 2026-07-29             # 실제 회수
+```
+시트는 읽기만 하고, 중복(`날짜_출처_금액_내역`)은 자동 제외한다.
+
+## 8. 클라우드 정리 (완료)
+- ✅ GitHub Actions cron 제거됨 — `fetch_emails.yml`은 비상용 수동 실행만 남음
+- Streamlit Cloud 앱 삭제 (선택). 삭제 전 Secrets 화면의 값은 로컬 secrets.toml에 이미 옮겨져 있어야 함
+- Google Sheets는 백업본으로 그냥 둬도 무방 (회수 후에는 로컬 DB가 정본)
+- 저장소가 public이면 **private 전환 권장** — Actions 로그에 거래 내역이 남을 수 있음
 
 ## 되돌리기
 `secrets.toml`에서 `STORAGE` 줄을 지우면 즉시 Google Sheets 모드로 복귀합니다.

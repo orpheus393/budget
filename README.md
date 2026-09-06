@@ -1,30 +1,34 @@
 # 💰 가계부 자동화
 
-> 💻 **PC에서 전부 로컬로 돌리고 싶다면** (Google Sheets → SQLite, 클라우드 의존 제거):
-> [README-LOCAL.md](README-LOCAL.md) 참고. `secrets.toml`에 `STORAGE = "sqlite"` 한 줄로 전환.
+> 💻 **2026-09부터 PC 로컬 모드가 기본입니다** — 수집·저장·대시보드 전부 PC에서 돕니다.
+> 설치와 운영은 [README-LOCAL.md](README-LOCAL.md) 참고. 클라우드 정기 수집(cron)은
+> 제거됐습니다 (클라우드와 PC가 동시에 돌면 먼저 처리한 쪽이 메일을 '처리완료'로
+> 옮겨 다른 쪽이 그 거래를 놓치기 때문). 아래 클라우드 설명은 비상용 수동 실행 기준입니다.
 
-## 구조
+## 구조 (로컬 모드)
 ```
-GitHub Actions (1일 1회, 09:00 KST)
-    → 네이버 이메일 파싱
+Windows 작업 스케줄러 (매일 09:00)
+    → scripts/run_local_fetch.py → 네이버 이메일 파싱
         · 월간 카드 명세서 자동 수집: BC카드 PDF, KB국민카드 HTML
         · 카카오뱅크 '거래내역 엑셀' 내보내기 첨부 자동 수집
         · 보금자리론 안내, (도착 시) 은행 통지 메일
-    → Google Sheets 저장
+    → SQLite 저장 (data/budget.db)
           ↓
 사용자 수동 업로드 (대시보드 통합 인박스)
     · 현대카드 Excel, IBK 거래내역 Excel (+ 카뱅 파일 직접 업로드도 가능)
-    → Google Sheets 저장
+    → SQLite 저장
           ↓
-Streamlit Cloud (대시보드)
-    → Google Sheets 읽기 → 대시보드 표시
+로컬 Streamlit (streamlit run app.py)
+    → SQLite 읽기 → 대시보드 표시
 ```
+
+`STORAGE = "sqlite"` 줄을 지우면 예전 Google Sheets 모드로 즉시 복귀합니다.
 
 > **수집 방식이 두 갈래인 이유**: 한국 은행·카드사는 실시간 입출금/결제 알림을
 > 이메일이 아니라 앱푸시·카카오톡·SMS로만 보냅니다. 이메일로 정기적으로 오는 건
 > **월 1회 카드 명세서**뿐이라, cron은 이것만 자동 수집하고 나머지(카뱅·IBK 통장,
 > 현대카드 사용내역)는 사용자가 각 앱에서 Excel을 받아 대시보드에 업로드합니다.
-> cron이 1일 1회인 것도 이 때문 — 매시간 돌려도 새로 올 메일이 없습니다.
+> 수집이 1일 1회인 것도 이 때문 — 더 자주 돌려도 새로 올 메일이 없습니다.
 
 ## 설정 순서
 
