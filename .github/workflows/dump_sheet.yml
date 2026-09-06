@@ -6,7 +6,7 @@ on:
       source_filter:
         description: '출처 필터 (예: BC카드, 비워두면 전체)'
         required: false
-        default: 'BC카드'
+        default: ''
         type: string
       limit:
         description: '최대 출력 행 수'
