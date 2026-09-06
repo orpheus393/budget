@@ -127,3 +127,22 @@ def test_is_statement_email_kb_resend_and_excludes_setup():
     assert not email_parser.is_statement_email(
         "(KB국민카드) 임*재님! KB국민카드 명세서 수령방법이 이메일로 신청완료!"
     )
+
+
+def test_is_statement_email_monthly_without_resend():
+    """'재발송' 없는 월별 정기 명세서 — KB 7월분 누락 회귀 (실제 제목)."""
+    assert email_parser.is_statement_email("(KB국민카드) 임*재님 2026년07월 명세서")
+    assert email_parser.is_statement_email("(KB국민카드) 임*재님 2026년 08월 명세서")
+
+
+def test_is_statement_email_spaced_variant():
+    """'이메일 명세서'처럼 띄어쓴 제목(현대카드)도 명세서로 인식."""
+    assert email_parser.is_statement_email(
+        "[현대카드] 2026년07월15일 이메일 명세서 입니다."
+    )
+
+
+def test_is_statement_email_still_rejects_alerts():
+    """월/일 숫자가 있어도 명세서가 아닌 결제 알림은 계속 False."""
+    assert not email_parser.is_statement_email("[KB국민카드] 결제 안내")
+    assert not email_parser.is_statement_email("BC카드 12,500원 승인 2026년 07월 15일")
