@@ -13,6 +13,16 @@ on:
         required: false
         default: '50'
         type: string
+      summary_only:
+        description: '집계만 출력 (월×출처 건수). public 저장소에서는 로그가 공개되므로 권장'
+        required: false
+        default: 'false'
+        type: string
+      since:
+        description: '이 날짜 이후 행만 (YYYY-MM-DD, 선택)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   dump:
@@ -40,4 +50,6 @@ jobs:
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           SOURCE_FILTER: ${{ inputs.source_filter }}
           LIMIT: ${{ inputs.limit }}
+          SUMMARY_ONLY: ${{ inputs.summary_only }}
+          SINCE: ${{ inputs.since }}
         run: python scripts/dump_sheet.py
