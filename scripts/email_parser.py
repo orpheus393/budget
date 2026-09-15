@@ -5,11 +5,19 @@ email_parser.py
 """
 
 import base64
+import difflib
 import email
 import html as html_module
 import imaplib
 import os
 import re
+import sys
+
+# 업로드 파서(upload_parsers.py)는 저장소 루트에 있다. `python scripts/email_parser.py`로
+# 실행하면 sys.path[0]이 scripts/라서 루트가 잡히지 않으므로 직접 넣어준다.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from datetime import datetime, timedelta
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
@@ -59,6 +67,9 @@ IMAP_FOLDERS = [
     "INBOX",
     "&zK2tbAC3rLDIHA-",   # 청구/결제 폴더
     "&yPy7OA-|&vDDBoQ-",  # 네이버페이 등
+    # 내게쓴메일함 — 네이버는 '내게쓰기'로 보낸 메일을 INBOX가 아니라 이 폴더에
+    # 넣는다. process_self_uploads의 유일한 유입 경로라 반드시 포함해야 한다.
+    "&sLSsjMT0ulTHfNVo-",
 ]
 
 # ── 비거래 이메일 분류 규칙 ───────────────────────────
@@ -720,6 +731,120 @@ def process_kakao_exports(mail, folders: list, dest_folders: dict) -> tuple:
     return transactions, moved
 
 
+_UPLOAD_EXTS = (".xls", ".xlsx", ".csv", ".htm", ".html")
+
+
+def iter_upload_attachments(msg):
+    """메일 첨부 중 거래내역 파일일 수 있는 것만 (파일명, 바이트)로 내놓는다."""
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        raw_name = part.get_filename()
+        if not raw_name:
+            continue
+        name = decode_str(raw_name)
+        if not name.lower().endswith(_UPLOAD_EXTS):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if payload:
+            yield name, payload
+
+
+def dataframe_to_transactions(df, source: str, filename: str) -> list:
+    """업로드 파서가 낸 DataFrame → save_to_sheets가 받는 거래 dict 리스트."""
+    txs = []
+    for _, row in df.iterrows():
+        amount = row.get("금액", 0)
+        try:
+            amount = int(float(amount))
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        txs.append({
+            "날짜": str(row.get("날짜", "")),
+            "시간": str(row.get("시간", "") or ""),
+            "출처": str(row.get("출처", "") or source),
+            "유형": str(row.get("유형", "") or "출금"),
+            "금액": amount,
+            "내역": str(row.get("내역", "") or "")[:50],
+            "카테고리": str(row.get("카테고리", "") or "기타"),
+            "원문": str(row.get("원문", "") or f"{source} 메일첨부") + f" | {filename}",
+            "잔액": str(row.get("잔액", "") or ""),
+            # 대시보드 업로드('수동:')와 구분 — 메일만 보내면 끝나는 경로.
+            "입력경로": f"자동:메일첨부:{source}",
+        })
+    return txs
+
+
+def process_self_uploads(mail, folders: list, dest_folders: dict) -> tuple:
+    """내가 나에게 보낸 메일의 첨부를 자동 적재. (transactions, moved) 반환.
+
+    현대카드·IBK기업은행은 건별 알림 메일이 없어 사이트에서 파일을 받아야만
+    한다. 지금까지는 그 파일을 대시보드에 업로드해야 했지만(입력경로 '수동:'),
+    이 패스가 있으면 **받은 파일을 자기 메일로 보내기만 하면** 끝난다.
+    폰에서 받은 첨부도 전달 한 번이면 되고 Streamlit을 띄울 필요가 없다.
+
+    파서는 app.py와 같은 upload_parsers.parse_any_file — 파일 '내용'으로 기관을
+    감지하므로 제목·파일명 규칙이 필요 없다. 인식 못 한 첨부는 조용히 건너뛰고
+    메일도 그대로 둬서(이동 안 함) 다음 실행에 재시도한다.
+    """
+    from upload_parsers import parse_any_file
+
+    transactions = []
+    moved = 0
+    if not NAVER_EMAIL:
+        return transactions, moved
+    since = (datetime.now() - timedelta(days=STATEMENT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+
+    for folder in folders:
+        try:
+            if mail.select(f'"{folder}"', readonly=False)[0] != "OK":
+                continue
+            _, data = mail.search(None, f'(SINCE "{since}" FROM "{NAVER_EMAIL}")')
+            eids = data[0].split() if data and data[0] else []
+        except Exception as exc:
+            print(f"셀프 업로드 검색 실패 ({folder}): {exc}")
+            continue
+
+        for eid in eids:
+            try:
+                _, msg_data = mail.fetch(eid, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_str(msg.get("Subject", ""))
+            except Exception as exc:
+                print(f"셀프 업로드 FETCH 실패 (eid={eid}): {exc}")
+                continue
+
+            parsed_any = False
+            for fname, raw in iter_upload_attachments(msg):
+                try:
+                    source, df = parse_any_file(fname, raw, password=KAKAO_XLSX_PASSWORD)
+                except Exception as exc:
+                    print(f"  · 첨부 인식 실패, 건너뜀: {fname} ({exc})")
+                    continue
+                txs = dataframe_to_transactions(df, source, fname)
+                if txs:
+                    transactions.extend(txs)
+                    parsed_any = True
+                    print(f"  · 셀프 업로드 [{source}] {fname}: {len(txs)}건 추출")
+
+            # 한 건이라도 적재된 메일만 치운다 — 실패분은 남겨 재시도.
+            if parsed_any and ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
+                if move_email(mail, eid, dest_folders["처리완료"]):
+                    moved += 1
+
+        if ENABLE_EMAIL_CLEANUP:
+            try:
+                mail.expunge()
+            except Exception:
+                pass
+    return transactions, moved
+
+
 def _norm_header_cell(s) -> str:
     return re.sub(r"\s+", "", str(s or ""))
 
@@ -1064,9 +1189,20 @@ def _ocr_page_words(page, dpi: int, scale: float) -> list:
         print(f"    [hybrid] 렌더링 실패: {exc}")
         return []
 
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        pix.save(f.name)
-        png_path = f.name
+    # Windows에서는 NamedTemporaryFile이 핸들을 연 채라 MuPDF가 같은 경로에
+    # 쓰지 못하고 FzErrorSystem(Permission denied)으로 죽는다. 경로만 잡고
+    # 핸들은 즉시 닫은 뒤 넘긴다.
+    fd, png_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        pix.save(png_path)
+    except Exception as exc:
+        print(f"    [hybrid] PNG 저장 실패: {exc}")
+        try:
+            os.unlink(png_path)
+        except OSError:
+            pass
+        return []
 
     try:
         result = subprocess.run(
@@ -1388,15 +1524,73 @@ def parse_pdf_transactions(pdf_bytes: bytes, password: str,
     return _dedup_pdf_transactions(plumber_txs or pymupdf_txs)
 
 
+# BC카드 월간명세서는 온누리상품권·정부지원금 결제를 "라벨+가맹점" 줄과
+# "가맹점만" 줄로 두 번 적는다. 그대로 파싱하면 같은 거래가 2건이 되어
+# 지출이 이중 계상된다 (2026-05~08 실제 17쌍 289,610원 과다).
+# OCR 오독까지 감안해 글자 사이 공백·누락을 허용하는 느슨한 패턴으로 떼어낸다.
+_PAYMENT_LABEL_RE = re.compile(
+    r"(?:온\s*누\s*리?\s*(?:전\s*자\s*(?:상\s*품\s*권|민)?|자\s*동)?\s*(?:충\s*전)?"
+    r"|고\s*유\s*가\s*피\s*해\s*지\s*원\s*금?)"
+)
+
+
+def strip_payment_label(merchant: str) -> str:
+    """가맹점명에 붙은 결제프로그램 라벨 제거. 라벨뿐이면 원본을 지킨다."""
+    if not merchant:
+        return ""
+    stripped = _PAYMENT_LABEL_RE.sub(" ", merchant)
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ._#|-")
+    return stripped or merchant.strip()
+
+
+def _merchant_fingerprint(merchant: str) -> str:
+    """중복 판정용 지문 — 라벨·구두점·숫자 제거."""
+    return re.sub(r"[\s_.#()|@0-9-]", "", strip_payment_label(merchant))
+
+
+def _merchant_noise(merchant: str) -> tuple:
+    """작을수록 좋은 이름. 라벨은 어차피 떼고 저장하므로 **뗀 뒤의 이름**으로
+    판정한다 — 라벨 붙은 줄이 오히려 가맹점명은 멀쩡한 경우가 있다
+    (예: `_7@0 알찬농산` vs `온누리전자상품권 _ 알찬농산`).
+
+    (OCR 잡음문자 수, 라벨 있었는지, 길이 역순)
+    """
+    m = merchant or ""
+    stripped = strip_payment_label(m)
+    return (len(re.findall(r"[_@#|]", stripped)),
+            1 if _PAYMENT_LABEL_RE.search(m) else 0,
+            -len(stripped))
+
+
 def _dedup_pdf_transactions(txs: list) -> list:
-    seen = set()
+    """PDF 파싱 결과 중복 제거.
+
+    완전 일치뿐 아니라 '같은 날·같은 금액인데 가맹점명만 라벨/OCR 차이'인
+    쌍도 하나로 접는다. 남기는 쪽은 라벨이 없고 잡음이 적은 이름.
+    """
     out = []
+    buckets = {}  # (날짜, 금액) -> out 인덱스 목록
     for tx in txs:
-        key = (tx["날짜"], tx["내역"], tx["금액"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(tx)
+        fp = _merchant_fingerprint(tx["내역"])
+        bucket = buckets.setdefault((tx["날짜"], tx["금액"]), [])
+        dup_idx = None
+        for i in bucket:
+            other = _merchant_fingerprint(out[i]["내역"])
+            if not fp or not other:
+                continue
+            if (fp == other or fp in other or other in fp
+                    or difflib.SequenceMatcher(None, fp, other).ratio() >= 0.7):
+                dup_idx = i
+                break
+        if dup_idx is None:
+            bucket.append(len(out))
+            out.append(tx)
+        elif _merchant_noise(tx["내역"]) < _merchant_noise(out[dup_idx]["내역"]):
+            out[dup_idx] = tx  # 더 깨끗한 이름 쪽으로 교체
+
+    # 살아남은 건 라벨을 떼고 저장 — 라벨 줄만 있는 거래도 이름이 깔끔해진다.
+    for tx in out:
+        tx["내역"] = strip_payment_label(tx["내역"])[:50] or tx["내역"]
     return out
 
 
@@ -1739,10 +1933,19 @@ def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
                     f"  · BC카드 명세서 PDF 파싱 중: {fname or '(이름 없음)'} "
                     f"({len(pdf_bytes):,}B)"
                 )
-                pdf_txs = parse_pdf_transactions(pdf_bytes, "", s_year, s_month)
-                if not pdf_txs and BC_PDF_PASSWORD:
-                    print("    [재시도] BC_PDF_PASSWORD로 복호화")
-                    pdf_txs = parse_pdf_transactions(pdf_bytes, BC_PDF_PASSWORD, s_year, s_month)
+                # 한 통이 터져도 나머지 명세서·다른 패스는 살려야 한다.
+                # (2026-09 실제 사고: PDF 렌더링 예외가 명세서 패스 전체를 중단시켜
+                #  BC·KB 수집이 통째로 멈췄다.)
+                try:
+                    pdf_txs = parse_pdf_transactions(pdf_bytes, "", s_year, s_month)
+                    if not pdf_txs and BC_PDF_PASSWORD:
+                        print("    [재시도] BC_PDF_PASSWORD로 복호화")
+                        pdf_txs = parse_pdf_transactions(
+                            pdf_bytes, BC_PDF_PASSWORD, s_year, s_month)
+                except Exception as exc:
+                    print(f"    ❌ PDF 파싱 실패, 메일 보존하고 건너뜀: "
+                          f"{type(exc).__name__}: {exc}")
+                    continue
 
                 if pdf_txs:
                     transactions.extend(pdf_txs)
@@ -2115,6 +2318,16 @@ def main():
         total_moved["카뱅내보내기"] = kk_moved
     except Exception as exc:
         print(f"카뱅 내보내기 처리 실패: {exc}")
+
+    # 셀프 업로드 — 내가 나에게 보낸 메일의 첨부(현대카드·IBK·카뱅 거래내역).
+    # 이 두 곳은 건별 알림 메일이 없어 파일을 받아야만 하는데, 대시보드를
+    # 띄우는 대신 메일로 보내기만 하면 여기서 자동 적재된다.
+    try:
+        up_txs, up_moved = process_self_uploads(mail, IMAP_FOLDERS, dest_folders)
+        all_transactions.extend(up_txs)
+        total_moved["셀프업로드"] = up_moved
+    except Exception as exc:
+        print(f"셀프 업로드 처리 실패: {exc}")
 
     # 주택금융공사 보금자리론 안내 — 회차 정보를 보금자리론 워크시트에 자동 누적
     try:
