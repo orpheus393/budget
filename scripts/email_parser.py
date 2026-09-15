@@ -67,6 +67,9 @@ IMAP_FOLDERS = [
     "INBOX",
     "&zK2tbAC3rLDIHA-",   # 청구/결제 폴더
     "&yPy7OA-|&vDDBoQ-",  # 네이버페이 등
+    # 내게쓴메일함 — 네이버는 '내게쓰기'로 보낸 메일을 INBOX가 아니라 이 폴더에
+    # 넣는다. process_self_uploads의 유일한 유입 경로라 반드시 포함해야 한다.
+    "&sLSsjMT0ulTHfNVo-",
 ]
 
 # ── 비거래 이메일 분류 규칙 ───────────────────────────
