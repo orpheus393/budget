@@ -1189,9 +1189,20 @@ def _ocr_page_words(page, dpi: int, scale: float) -> list:
         print(f"    [hybrid] 렌더링 실패: {exc}")
         return []
 
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        pix.save(f.name)
-        png_path = f.name
+    # Windows에서는 NamedTemporaryFile이 핸들을 연 채라 MuPDF가 같은 경로에
+    # 쓰지 못하고 FzErrorSystem(Permission denied)으로 죽는다. 경로만 잡고
+    # 핸들은 즉시 닫은 뒤 넘긴다.
+    fd, png_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        pix.save(png_path)
+    except Exception as exc:
+        print(f"    [hybrid] PNG 저장 실패: {exc}")
+        try:
+            os.unlink(png_path)
+        except OSError:
+            pass
+        return []
 
     try:
         result = subprocess.run(
@@ -1922,10 +1933,19 @@ def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
                     f"  · BC카드 명세서 PDF 파싱 중: {fname or '(이름 없음)'} "
                     f"({len(pdf_bytes):,}B)"
                 )
-                pdf_txs = parse_pdf_transactions(pdf_bytes, "", s_year, s_month)
-                if not pdf_txs and BC_PDF_PASSWORD:
-                    print("    [재시도] BC_PDF_PASSWORD로 복호화")
-                    pdf_txs = parse_pdf_transactions(pdf_bytes, BC_PDF_PASSWORD, s_year, s_month)
+                # 한 통이 터져도 나머지 명세서·다른 패스는 살려야 한다.
+                # (2026-09 실제 사고: PDF 렌더링 예외가 명세서 패스 전체를 중단시켜
+                #  BC·KB 수집이 통째로 멈췄다.)
+                try:
+                    pdf_txs = parse_pdf_transactions(pdf_bytes, "", s_year, s_month)
+                    if not pdf_txs and BC_PDF_PASSWORD:
+                        print("    [재시도] BC_PDF_PASSWORD로 복호화")
+                        pdf_txs = parse_pdf_transactions(
+                            pdf_bytes, BC_PDF_PASSWORD, s_year, s_month)
+                except Exception as exc:
+                    print(f"    ❌ PDF 파싱 실패, 메일 보존하고 건너뜀: "
+                          f"{type(exc).__name__}: {exc}")
+                    continue
 
                 if pdf_txs:
                     transactions.extend(pdf_txs)
