@@ -6,12 +6,22 @@ on:
       source_filter:
         description: '출처 필터 (예: BC카드, 비워두면 전체)'
         required: false
-        default: 'BC카드'
+        default: ''
         type: string
       limit:
         description: '최대 출력 행 수'
         required: false
         default: '50'
+        type: string
+      summary_only:
+        description: '집계만 출력 (월×출처 건수). public 저장소에서는 로그가 공개되므로 권장'
+        required: false
+        default: 'false'
+        type: string
+      since:
+        description: '이 날짜 이후 행만 (YYYY-MM-DD, 선택)'
+        required: false
+        default: ''
         type: string
 
 jobs:
@@ -40,4 +50,6 @@ jobs:
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           SOURCE_FILTER: ${{ inputs.source_filter }}
           LIMIT: ${{ inputs.limit }}
+          SUMMARY_ONLY: ${{ inputs.summary_only }}
+          SINCE: ${{ inputs.since }}
         run: python scripts/dump_sheet.py
