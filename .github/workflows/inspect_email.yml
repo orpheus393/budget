@@ -15,6 +15,10 @@ on:
         description: '폴더당 최대 메일 수'
         required: false
         default: '3'
+      redact:
+        description: "형태만 출력 (가맹점·금액 비노출). public 저장소에서는 'true' 유지"
+        required: false
+        default: 'true'
 
 jobs:
   inspect:
@@ -43,5 +47,6 @@ jobs:
           EMAIL_INSPECT_FROM: ${{ github.event.inputs.from_filter }}
           EMAIL_INSPECT_DAYS: ${{ github.event.inputs.days }}
           EMAIL_INSPECT_MAX: ${{ github.event.inputs.max_mails }}
-          EMAIL_INSPECT_PDF_PW: ${{ secrets.KB_PDF_PASSWORD }}
+          EMAIL_INSPECT_PDF_PW: ${{ secrets.KB_PDF_PASSWORD || secrets.BC_PDF_PASSWORD }}
+          EMAIL_INSPECT_REDACT: ${{ github.event.inputs.redact || 'true' }}
         run: python scripts/inspect_email.py

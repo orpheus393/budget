@@ -5,8 +5,11 @@
 
     python scripts/run_local_inspect.py hyundaicard        # 최근 60일, 3통
     python scripts/run_local_inspect.py kbcard 40 2        # 40일, 2통
+    python scripts/run_local_inspect.py hyundaicard --raw  # 내용까지 (내 PC에서만)
 
-출력에 시크릿은 포함되지 않지만 카드 거래 내역이 찍히므로 공유 시 주의.
+기본은 '형태만' 출력 — 가맹점·금액·카드번호 대신 자리수 토큰(가7, #6)만 남아
+그대로 공유해도 안전하다 (파서 설계에는 이 정도면 충분). 결과는 화면과
+inspect_<발신자>.txt 파일에 함께 기록된다.
 """
 
 import os
@@ -37,19 +40,35 @@ def main():
         print("❌ secrets.toml에 NAVER_EMAIL / NAVER_APP_PW 필요")
         sys.exit(1)
 
-    env["EMAIL_INSPECT_FROM"] = sys.argv[1]
-    env["EMAIL_INSPECT_DAYS"] = sys.argv[2] if len(sys.argv) > 2 else "60"
-    env["EMAIL_INSPECT_MAX"] = sys.argv[3] if len(sys.argv) > 3 else "3"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    raw = "--raw" in sys.argv
+    env["EMAIL_INSPECT_FROM"] = args[0]
+    env["EMAIL_INSPECT_DAYS"] = args[1] if len(args) > 1 else "60"
+    env["EMAIL_INSPECT_MAX"] = args[2] if len(args) > 2 else "3"
+    env["EMAIL_INSPECT_REDACT"] = "0" if raw else "1"
     # 명세서 PDF는 카드사 공통으로 생년월일 6자리 (BC와 같은 값)
     if secrets.get("BC_PDF_PASSWORD"):
         env["EMAIL_INSPECT_PDF_PW"] = str(secrets["BC_PDF_PASSWORD"])
 
+    out_path = os.path.join(REPO_ROOT, f"inspect_{env['EMAIL_INSPECT_FROM']}.txt")
     print(f"🔍 inspect: from={env['EMAIL_INSPECT_FROM']} "
-          f"days={env['EMAIL_INSPECT_DAYS']} max={env['EMAIL_INSPECT_MAX']}")
+          f"days={env['EMAIL_INSPECT_DAYS']} max={env['EMAIL_INSPECT_MAX']} "
+          f"mode={'원문(공유 금지)' if raw else '형태만(공유 가능)'}")
     result = subprocess.run(
         [sys.executable, os.path.join(REPO_ROOT, "scripts", "inspect_email.py")],
-        env=env, cwd=REPO_ROOT,
+        env=env, cwd=REPO_ROOT, capture_output=True, text=True,
     )
+    output = (result.stdout or "") + (result.stderr or "")
+    print(output)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(output)
+    print(f"💾 저장: {out_path}"
+          + ("" if raw else " — 이 파일은 그대로 공유해도 안전합니다"))
+    if "Authentication failed" in output:
+        print("\n❗ 네이버 로그인 실패 — 앱 비밀번호가 만료·변경됐을 수 있습니다.\n"
+              "   네이버 > 내정보 > 보안설정 > 애플리케이션 비밀번호에서 새로 발급한 뒤\n"
+              "   .streamlit/secrets.toml의 NAVER_APP_PW를 교체하세요.\n"
+              "   (같은 값을 쓰는 매일 수집도 함께 멈춰 있습니다)")
     sys.exit(result.returncode)
 
 

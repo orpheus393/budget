@@ -59,10 +59,21 @@ streamlit run app.py
 python scripts\run_local_fetch.py        # 최근 26시간
 python scripts\run_local_fetch.py 720    # 밀린 30일치 일회 수집
 ```
+수집 결과는 `logs\fetch_*.log`에 남는다 (작업 스케줄러로 돌면 화면 출력이
+사라지므로 — 뭔가 안 들어왔을 때 가장 먼저 볼 곳).
+
 메일 구조 확인 (새 카드사 파서 만들 때):
 ```powershell
-python scripts\run_local_inspect.py hyundaicard 40 2
+python scripts\run_local_inspect.py hyundaicard 90 2
 ```
+기본이 **형태만 출력**이라 가맹점·금액 대신 자리수 토큰(`가7`, `#6`)만 남는다.
+결과는 `inspect_hyundaicard.txt`로도 저장되며 **그대로 공유해도 안전**하다.
+(`--raw`를 붙이면 원문 — 내 PC에서만 볼 것.)
+
+### 네이버 로그인이 실패할 때
+`Authentication failed`가 보이면 앱 비밀번호가 만료·변경된 것이다. 네이버 >
+내정보 > 보안설정 > **애플리케이션 비밀번호**에서 새로 발급해 `secrets.toml`의
+`NAVER_APP_PW`를 교체한다. 교체 전까지 수집은 한 건도 들어오지 않는다.
 
 매일 09:00 자동 실행 등록 (관리자 PowerShell):
 ```powershell
