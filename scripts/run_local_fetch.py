@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tomllib
+from datetime import datetime
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -54,8 +55,25 @@ def main():
     print(f"📬 로컬 수집 시작 (lookback {env['LOOKBACK_HOURS']}h → {env['DB_PATH']})")
     result = subprocess.run(
         [sys.executable, os.path.join(REPO_ROOT, "scripts", "email_parser.py")],
-        env=env, cwd=REPO_ROOT,
+        env=env, cwd=REPO_ROOT, capture_output=True, text=True,
     )
+    output = (result.stdout or "") + (result.stderr or "")
+    print(output, end="")
+
+    # 작업 스케줄러로 돌면 화면 출력이 사라진다. 실패를 나중에 추적할 수 있게
+    # 항상 로그로 남긴다 (조용한 실패 방지).
+    log_dir = os.path.join(REPO_ROOT, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"fetch_{datetime.now():%Y%m%d_%H%M%S}.log")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(output)
+    print(f"📝 로그: {log_path}")
+
+    if "Authentication failed" in output:
+        print("\n❗ 네이버 로그인 실패 — 앱 비밀번호가 만료·변경된 것으로 보입니다.\n"
+              "   네이버 > 내정보 > 보안설정 > 애플리케이션 비밀번호에서 새로 발급한 뒤\n"
+              "   .streamlit/secrets.toml의 NAVER_APP_PW를 교체하세요.\n"
+              "   교체 전까지 매일 수집은 아무것도 가져오지 못합니다.")
     sys.exit(result.returncode)
 
 

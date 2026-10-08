@@ -5,7 +5,6 @@
 """
 
 import os
-import re
 import sys
 
 os.environ.setdefault("NAVER_EMAIL", "t@example.com")
@@ -36,7 +35,14 @@ def test_column_layout_preserved():
 
 
 def test_card_number_masked():
-    assert not re.search(r"\d", inspect_email.shape("1234-5678-9012-3456"))
+    """카드번호는 자리수 표기(#4)만 남고 원래 숫자는 사라진다.
+
+    출력의 '#4'에도 숫자 문자가 들어가므로 '숫자 없음'이 아니라
+    '원문 토큰이 남지 않음'을 검증한다.
+    """
+    out = inspect_email.shape("1234-5678-9012-3456")
+    assert out == "#4-#4-#4-#4"
+    assert "1234" not in out and "9012" not in out
 
 
 def test_latin_and_hangul_lengths_reported():
