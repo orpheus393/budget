@@ -53,7 +53,7 @@ streamlit run app.py
 브라우저가 `http://localhost:8501`로 열립니다. 통합 업로드 인박스·분석·예산 전부 동일하게 작동 —
 이제 Google API 왕복이 없어 훨씬 빠릅니다.
 
-## 6. 이메일 수집 자동화 (BC/KB/현대 명세서 + 카뱅 내보내기)
+## 6. 이메일 수집 자동화 (BC/KB 명세서 + 카뱅 내보내기)
 수동 실행:
 ```powershell
 python scripts\run_local_fetch.py        # 최근 26시간
