@@ -11,6 +11,7 @@ import html as html_module
 import imaplib
 import os
 import re
+import shutil
 import sys
 
 # 업로드 파서(upload_parsers.py)는 저장소 루트에 있다. `python scripts/email_parser.py`로
@@ -1176,6 +1177,26 @@ def _squeeze_korean_spaces(s: str) -> str:
     return s
 
 
+def _tesseract_cmd() -> str:
+    """tesseract 실행 파일 경로.
+
+    Windows 설치본(UB-Mannheim)은 PATH에 자기를 등록하지 않아 그냥 "tesseract"로
+    부르면 FileNotFoundError가 난다. 작업 스케줄러에서도 같은 문제가 생기므로
+    PATH → 표준 설치 경로 순으로 찾고, TESSERACT_CMD로 덮어쓸 수 있게 둔다.
+    """
+    override = os.environ.get("TESSERACT_CMD", "").strip()
+    if override:
+        return override
+    found = shutil.which("tesseract")
+    if found:
+        return found
+    for cand in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                 r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
+        if os.path.exists(cand):
+            return cand
+    return "tesseract"  # 없으면 FileNotFoundError로 떨어져 상위에서 처리
+
+
 def _ocr_page_words(page, dpi: int, scale: float) -> list:
     """PDF 페이지를 PNG로 렌더링 후 Tesseract TSV로 OCR.
     반환: [(x_pt, y_pt_center, text), ...] — PDF 좌표계로 변환된 단어 리스트."""
@@ -1206,8 +1227,11 @@ def _ocr_page_words(page, dpi: int, scale: float) -> list:
 
     try:
         result = subprocess.run(
-            ["tesseract", png_path, "-", "-l", "kor+eng", "--psm", "4", "tsv"],
-            capture_output=True, text=True, timeout=120,
+            [_tesseract_cmd(), png_path, "-", "-l", "kor+eng", "--psm", "4", "tsv"],
+            # tesseract는 UTF-8로 출력한다. text=True만 주면 한국어 Windows에선
+            # cp949로 디코딩하다 실패해 stdout이 None이 된다(Linux는 기본 UTF-8).
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120,
         )
         tsv = result.stdout
     except FileNotFoundError:
