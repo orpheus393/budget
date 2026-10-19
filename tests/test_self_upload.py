@@ -115,3 +115,19 @@ if __name__ == "__main__":
             fn()
             print(f"✅ {name}")
     print("전부 통과")
+
+
+# ── 환경 오염 방지 ─────────────────────────────────────
+def test_owner_name_lookup_does_not_touch_env(monkeypatch):
+    """_get_owner_name이 streamlit을 새로 import해 secrets.toml로 os.environ을
+    덮어쓰면, 호출자가 지정한 DB_PATH가 실행 도중 바뀐다.
+    (2026-10 실제 사고: 사본 리허설이 실제 DB에 기록됨)"""
+    import sys as _sys
+    monkeypatch.delenv("OWNER_NAME", raising=False)
+    monkeypatch.setenv("DB_PATH", "/tmp/should-stay.db")
+    monkeypatch.delitem(_sys.modules, "streamlit", raising=False)
+    before = dict(os.environ)
+    assert upload_parsers._get_owner_name() == "임영재"
+    assert os.environ.get("DB_PATH") == "/tmp/should-stay.db"
+    assert dict(os.environ) == before
+    assert "streamlit" not in _sys.modules, "cron 경로에서 streamlit을 import하면 안 된다"
