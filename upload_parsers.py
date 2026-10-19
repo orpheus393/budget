@@ -71,17 +71,24 @@ def _get_owner_name() -> str:
     이 이름이 거래 내역의 '내역'에 나타나면 (1) 농협=어머니차입금
     (2) 카뱅·토스=자기이체로 분기됨.
 
-    cron(streamlit 없는 경로)에서도 동작해야 하므로 OWNER_NAME 환경변수를
-    먼저 보고, 없을 때만 streamlit secrets를 지연 import해서 읽는다.
+    OWNER_NAME 환경변수를 먼저 본다. streamlit secrets는 **이미 import된
+    경우(대시보드 안)에만** 읽는다. cron 경로에서 streamlit을 새로 import하면
+    st.secrets가 .streamlit/secrets.toml의 최상위 키를 os.environ에 덮어써,
+    호출자가 지정한 DB_PATH 등이 실행 도중 바뀐다(2026-10 실제 사고: 사본에
+    대한 리허설이 실제 DB에 기록됨).
     """
+    import sys
+
     name = os.environ.get("OWNER_NAME", "").strip()
     if name:
         return name
-    try:
-        import streamlit as st
-        return st.secrets.get("OWNER_NAME", "") or "임영재"
-    except Exception:
-        return "임영재"
+    st = sys.modules.get("streamlit")
+    if st is not None:
+        try:
+            return st.secrets.get("OWNER_NAME", "") or "임영재"
+        except Exception:
+            pass
+    return "임영재"
 
 
 def guess_category(
