@@ -1572,6 +1572,174 @@ def prepare_dest_folders(mail) -> dict:
     return mapping
 
 
+# ── 현대카드 이메일 명세서 ──────────────────────────
+# app.py의 업로드 파서(HYUNDAI_COL_ALIASES)와 같은 컬럼 어휘·금액 규칙을 쓴다.
+# 같은 거래가 업로드와 메일 양쪽으로 들어와도 중복 키(날짜_출처_금액_내역)가
+# 일치해 한 번만 저장되게 하려는 것.
+HYUNDAI_COL_ALIASES = {
+    "날짜": ["이용일", "이용일자", "거래일", "거래일자", "사용일", "승인일자", "승인일"],
+    "시간": ["이용시간", "거래시간", "승인시간", "승인시각", "사용시간"],
+    "내역": ["이용가맹점", "가맹점명", "가맹점", "이용처", "사용처"],
+    "이용금액": ["이용금액", "승인금액", "이용금액(원)"],
+    "결제원금": ["결제원금"],   # 명세서: 할부의 이번달 분담액
+    "구분": ["이용구분", "거래구분", "구분", "할부", "할부개월", "할부/회차"],
+    "카드": ["이용카드", "카드구분", "카드종류"],
+}
+_HYUNDAI_SKIP = ("소계", "합계", "총계")
+
+
+def _html_tables_to_rows(html_text: str) -> list:
+    """HTML의 모든 <table>을 [[셀,...], ...] 행 목록으로. (표 단위로 분리)"""
+    tables = []
+    for tbl in re.findall(r"<table[^>]*>(.*?)</table>", html_text, re.I | re.S):
+        rows = []
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, re.I | re.S):
+            cells = []
+            for cell in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, re.I | re.S):
+                txt = re.sub(r"<[^>]+>", " ", cell)
+                txt = html_module.unescape(txt)
+                # 메일 HTML은 셀 안에 줄바꿈·연속 공백이 흔하다. 업로드 파서가
+                # 만드는 문자열과 같아지도록 하나의 공백으로 접는다 (중복 키 일치).
+                cells.append(re.sub(r"\s+", " ", txt).strip())
+            if cells:
+                rows.append(cells)
+        if rows:
+            tables.append(rows)
+    return tables
+
+
+def _match_hyundai_col(header: list, aliases: list):
+    """헤더 행에서 별칭에 해당하는 컬럼 인덱스. 완전 일치 우선, 부분 일치 fallback."""
+    for alias in aliases:
+        for i, cell in enumerate(header):
+            if cell == alias:
+                return i
+    for alias in aliases:
+        for i, cell in enumerate(header):
+            if alias and alias in cell:
+                return i
+    return None
+
+
+def _hyundai_amount(cell: str) -> int:
+    """부호 보존 정수. 취소·환불·매출할인은 음수로 들어온다."""
+    digits = re.sub(r"[^\d\-]", "", cell or "")
+    if not digits or digits == "-":
+        return 0
+    try:
+        return int(digits)
+    except ValueError:
+        return 0
+
+
+def _hyundai_date(cell: str, year: int) -> str:
+    """'2026.07.15' · '2026년 07월 15일' · '07.15' → ISO. 연도 없으면 명세 연도."""
+    cell = (cell or "").strip()
+    m = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", cell)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.fullmatch(r"(\d{1,2})\D+(\d{1,2})", cell)
+    if m:
+        return f"{year:04d}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    return ""
+
+
+def parse_hyundai_statement_html(html_text: str, year: int = 0) -> list:
+    """현대카드 이메일 명세서 HTML에서 거래 추출.
+
+    현대카드는 명세서를 본문 HTML 표로 보낸다 (웹 다운로드 .xls도 실제로는
+    HTML 표라 구조가 같다). 열 위치가 아니라 **열 이름**으로 찾으므로
+    카드사가 열 순서를 바꿔도 따라간다.
+
+    금액 규칙은 업로드 파서와 동일:
+      · '결제원금' 열이 있으면 그 값(이번달 분담액)을 쓴다 — 할부 거래의
+        전체 이용금액을 그대로 넣으면 실제 청구액과 어긋나기 때문.
+      · 음수(매출할인·취소·환불)는 입금으로 뒤집고 절대값을 저장.
+    """
+    year = year or datetime.now().year
+    transactions = []
+
+    for rows in _html_tables_to_rows(html_text):
+        targets = set(sum(HYUNDAI_COL_ALIASES.values(), []))
+        header_idx = None
+        for idx, row in enumerate(rows[:15]):
+            if sum(1 for c in row if c in targets) >= 2:
+                header_idx = idx
+                break
+        if header_idx is None:
+            continue
+
+        header = rows[header_idx]
+        i_date = _match_hyundai_col(header, HYUNDAI_COL_ALIASES["날짜"])
+        i_amt = _match_hyundai_col(header, HYUNDAI_COL_ALIASES["이용금액"])
+        i_pay = _match_hyundai_col(header, HYUNDAI_COL_ALIASES["결제원금"])
+        i_merchant = _match_hyundai_col(header, HYUNDAI_COL_ALIASES["내역"])
+        i_time = _match_hyundai_col(header, HYUNDAI_COL_ALIASES["시간"])
+        i_type = _match_hyundai_col(header, HYUNDAI_COL_ALIASES["구분"])
+        i_card = _match_hyundai_col(header, HYUNDAI_COL_ALIASES["카드"])
+        if i_date is None or (i_amt is None and i_pay is None):
+            continue
+
+        def cell(row, idx):
+            return row[idx] if idx is not None and idx < len(row) else ""
+
+        for row in rows[header_idx + 1:]:
+            date_iso = _hyundai_date(cell(row, i_date), year)
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_iso):
+                continue    # 소계·안내 행은 날짜 자리가 비어 있다
+            merchant = cell(row, i_merchant).strip() or "현대카드 사용"
+            if any(k in merchant for k in _HYUNDAI_SKIP):
+                continue
+            raw_amt = (_hyundai_amount(cell(row, i_pay)) if i_pay is not None
+                       else _hyundai_amount(cell(row, i_amt)))
+            if raw_amt == 0:
+                continue    # 0 = 다음 달로 이월된 할부 잔액
+            tx_type = "입금" if raw_amt < 0 else "출금"
+            if raw_amt > 0 and any(k in cell(row, i_type) for k in ("취소", "환불", "입금")):
+                tx_type = "입금"
+            card = cell(row, i_card).strip()
+            transactions.append({
+                "날짜": date_iso,
+                "시간": cell(row, i_time).strip(),
+                "출처": "현대카드",
+                "유형": tx_type,
+                "금액": abs(raw_amt),
+                "내역": merchant,
+                "카테고리": guess_category(merchant, tx_type),
+                "원문": f"현대카드 | {card}" if card else "현대카드 명세서",
+            })
+
+    return transactions
+
+
+def describe_hyundai_html(html_text: str) -> str:
+    """파싱 0건일 때 '무엇이 달랐는지'를 알려주는 진단 문자열.
+
+    실제 메일을 직접 열어볼 수 없는 환경에서도 첫 실행 로그만으로 원인을
+    좁힐 수 있게 한다. 공개 로그에 남을 수 있으므로 가맹점·금액은 찍지 않고
+    표 개수·행 수와 **헤더 후보 셀 이름만** 출력한다 (열 이름은 모든 고객이
+    동일한 양식 문구).
+    """
+    tables = _html_tables_to_rows(html_text)
+    if not tables:
+        return "표 없음 (본문이 이미지이거나 첨부에 들어 있을 수 있음)"
+    targets = set(sum(HYUNDAI_COL_ALIASES.values(), []))
+    parts = [f"표 {len(tables)}개"]
+    for n, rows in enumerate(tables, 1):
+        widths = {len(r) for r in rows}
+        best, hits = [], 0
+        for row in rows[:15]:
+            k = sum(1 for c in row if c in targets)
+            if k > hits:
+                best, hits = row, k
+        if hits:
+            parts.append(f"표{n}: {len(rows)}행 열폭{sorted(widths)} "
+                         f"헤더후보({hits}개 일치) {best[:12]}")
+        else:
+            parts.append(f"표{n}: {len(rows)}행 열폭{sorted(widths)} 헤더 미발견")
+    return " | ".join(parts)
+
+
 def process_kb_statements(mail, folders: list, dest_folders: dict) -> tuple:
     """KB국민카드 이메일 명세서 HTML 처리. (transactions, moved_count) 반환.
 
@@ -1664,6 +1832,109 @@ def process_kb_statements(mail, folders: list, dest_folders: dict) -> tuple:
                 mail.expunge()
             except Exception as exc:
                 print(f"KB 명세서 EXPUNGE 실패 ({folder}): {exc}")
+
+    return transactions, moved_count
+
+
+def process_hyundai_statements(mail, folders: list, dest_folders: dict) -> tuple:
+    """현대카드 이메일 명세서 처리. (transactions, moved_count) 반환.
+
+    파싱에 실패하면 메일을 옮기지 않고 그대로 둔다 — 파서를 고친 뒤 다시
+    돌리면 소급 수집되게. 0건일 때는 describe_hyundai_html()로 구조 진단을
+    남겨 다음 수정의 단서를 만든다.
+    """
+    transactions = []
+    moved_count = 0
+
+    since = (datetime.now() - timedelta(days=STATEMENT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+
+    for folder in folders:
+        try:
+            status, _ = mail.select(f'"{folder}"', readonly=False)
+            if status != "OK":
+                continue
+            _, data = mail.search(None, f'(SINCE "{since}" FROM "hyundaicard")')
+            eids = data[0].split() if data and data[0] else []
+        except Exception as exc:
+            print(f"현대카드 명세서 검색 실패 ({folder}): {exc}")
+            continue
+
+        for eid in eids:
+            try:
+                _, msg_data = mail.fetch(eid, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_str(msg.get("Subject", ""))
+                date_str = msg.get("Date", "")
+            except Exception as exc:
+                print(f"현대카드 명세서 FETCH 실패 (eid={eid}): {exc}")
+                continue
+
+            if not is_statement_email(subject):
+                continue
+
+            try:
+                stmt_year = parsedate_to_datetime(date_str).year
+            except Exception:
+                stmt_year = datetime.now().year
+
+            html_candidates = []
+            pdf_names = []
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                disp = header_str(part.get("Content-Disposition")).lower()
+                fn = decode_str(part.get_filename() or "")
+                is_attachment = "attachment" in disp or bool(fn)
+                if ctype == "text/html" and not is_attachment:
+                    try:
+                        payload = part.get_payload(decode=True) or b""
+                        cs = part.get_content_charset() or "cp949"
+                        html_candidates.append(("body", payload.decode(cs, errors="replace")))
+                    except Exception:
+                        pass
+                elif is_attachment and (ctype == "text/html"
+                                        or fn.lower().endswith((".html", ".htm"))):
+                    payload = part.get_payload(decode=True) or b""
+                    for enc in ("cp949", "utf-8", "euc-kr"):
+                        try:
+                            html_candidates.append((f"attach:{fn or '?'}", payload.decode(enc)))
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                elif is_attachment and (ctype == "application/pdf"
+                                        or fn.lower().endswith(".pdf")):
+                    pdf_names.append(fn or "(이름 없음)")
+
+            if not html_candidates:
+                extra = f" / PDF 첨부 {pdf_names}" if pdf_names else ""
+                print(f"  · 현대카드 명세서 HTML 없음: {subject[:50]}{extra}")
+                continue
+
+            print(f"  · 현대카드 명세서 후보 {len(html_candidates)}개: {subject[:50]}")
+            hy_txs, chosen = [], None
+            for label, html_text in html_candidates:
+                txs = parse_hyundai_statement_html(html_text, stmt_year)
+                if txs:
+                    hy_txs, chosen = txs, label
+                    break
+
+            if hy_txs:
+                transactions.extend(hy_txs)
+                print(f"    → {len(hy_txs)}건 추출 (소스: {chosen})")
+                if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
+                    if move_email(mail, eid, dest_folders["처리완료"]):
+                        moved_count += 1
+            else:
+                # 메일은 그대로 두고 구조만 알린다 (가맹점·금액은 찍지 않음).
+                print("    → 추출 0건, 메일 유지. 구조: "
+                      + describe_hyundai_html(html_candidates[0][1]))
+                if pdf_names:
+                    print(f"       PDF 첨부도 있음: {pdf_names}")
+
+        if ENABLE_EMAIL_CLEANUP:
+            try:
+                mail.expunge()
+            except Exception as exc:
+                print(f"현대카드 명세서 EXPUNGE 실패 ({folder}): {exc}")
 
     return transactions, moved_count
 
@@ -1993,12 +2264,14 @@ def build_summary_email(saved_count: int, total_moved: dict,
     보내 소음이 되지 않게 저장 0건 + 이벤트 0건이면 안 보낸다.
     """
     events = {k: v for k, v in (total_moved or {}).items()
-              if v and k in ("명세서", "KB명세서", "카뱅내보내기", "보금자리론")}
+              if v and k in ("명세서", "KB명세서", "현대명세서",
+                             "카뱅내보내기", "보금자리론")}
     if saved_count <= 0 and not events:
         return None, None
 
     lines = [f"저장된 거래: {saved_count}건 (파싱 {parsed_count}건, 중복 제외 후)"]
     label = {"명세서": "BC카드 명세서", "KB명세서": "KB카드 명세서",
+             "현대명세서": "현대카드 명세서",
              "카뱅내보내기": "카카오뱅크 내보내기", "보금자리론": "보금자리론 회차"}
     for k, v in events.items():
         lines.append(f"· {label.get(k, k)}: {v}건 처리")
@@ -2106,6 +2379,14 @@ def main():
         total_moved["KB명세서"] = kb_moved
     except Exception as exc:
         print(f"KB 명세서 처리 실패: {exc}")
+
+    # 현대카드 이메일 명세서 별도 패스
+    try:
+        hy_txs, hy_moved = process_hyundai_statements(mail, IMAP_FOLDERS, dest_folders)
+        all_transactions.extend(hy_txs)
+        total_moved["현대명세서"] = hy_moved
+    except Exception as exc:
+        print(f"현대카드 명세서 처리 실패: {exc}")
 
     # 카카오뱅크 '거래내역 엑셀' 내보내기 별도 패스
     # 사용자가 앱에서 '내보내기 → 이메일'만 누르면 첨부를 자동 수집.
