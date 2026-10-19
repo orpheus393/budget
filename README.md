@@ -9,13 +9,13 @@
 ```
 Windows 작업 스케줄러 (매일 09:00)
     → scripts/run_local_fetch.py → 네이버 이메일 파싱
-        · 월간 카드 명세서 자동 수집: BC카드 PDF, KB국민카드 HTML, 현대카드 HTML
+        · 월간 카드 명세서 자동 수집: BC카드 PDF, KB국민카드 HTML
         · 카카오뱅크 '거래내역 엑셀' 내보내기 첨부 자동 수집
         · 보금자리론 안내, (도착 시) 은행 통지 메일
     → SQLite 저장 (data/budget.db)
           ↓
 사용자 수동 업로드 (대시보드 통합 인박스)
-    · IBK 거래내역 Excel (+ 현대카드·카뱅 파일 직접 업로드도 가능)
+    · 현대카드 Excel, IBK 거래내역 Excel (+ 카뱅 파일 직접 업로드도 가능)
     → SQLite 저장
           ↓
 로컬 Streamlit (streamlit run app.py)
