@@ -23,6 +23,8 @@ FROM_FILTER = os.environ.get("EMAIL_INSPECT_FROM", "").strip()
 DAYS = int(os.environ.get("EMAIL_INSPECT_DAYS", "60"))
 MAX_MAILS = int(os.environ.get("EMAIL_INSPECT_MAX", "3"))
 PDF_PW = os.environ.get("EMAIL_INSPECT_PDF_PW", "")
+# 공개 저장소에서는 Actions 로그도 공개된다. 기본값 on — 내용 대신 '형태'만 출력.
+REDACT = os.environ.get("EMAIL_INSPECT_REDACT", "1").strip() not in ("0", "false", "no")
 
 if not NAVER_EMAIL or not NAVER_APP_PW:
     print("ERROR: NAVER_EMAIL / NAVER_APP_PW 환경변수가 필요합니다", file=sys.stderr)
@@ -67,6 +69,34 @@ def header_str(value) -> str:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+# 숫자 런에 콤마는 포함(12,500 → #6), 마침표·하이픈은 제외해
+# 날짜 구분자가 남게 한다 (2026.07.15 → #4.#2.#2).
+_SHAPE_RE = re.compile(r"[0-9][0-9,]*|[가-힣]+|[A-Za-z]+")
+
+
+def shape(text: str) -> str:
+    """거래 내용을 지우고 '레이아웃 형태'만 남긴다.
+
+    공개 저장소의 Actions 로그에 가맹점·금액·카드번호가 남지 않게 하면서도
+    파서를 설계하는 데 필요한 정보(열 개수, 구분자, 날짜/금액이 놓인 자리,
+    토큰 길이)는 보존한다. 예:
+        '2026.07.15  스타벅스강남점  12,500원' → '#4.#2.#2  가7  #6가1'
+    """
+    def repl(m):
+        tok = m.group(0)
+        n = len(tok)
+        if tok[0].isdigit():
+            return f"#{n}"
+        if "\uac00" <= tok[0] <= "\ud7a3":
+            return f"가{n}"
+        return f"A{n}"
+    return _SHAPE_RE.sub(repl, text)
+
+
+def show(text: str) -> str:
+    return shape(text) if REDACT else text
 
 
 def best_text(msg):
@@ -131,6 +161,8 @@ def try_pdf(payload: bytes, pw: str):
 def main():
     print(f"검색 발신자: '{FROM_FILTER}' / 최근 {DAYS}일 / 폴더당 최대 {MAX_MAILS}건")
     print(f"PDF 비밀번호: {'설정됨' if PDF_PW else '미설정'}")
+    print("출력 모드: " + ("🔒 형태만 (내용 비노출)" if REDACT
+                        else "⚠️ 원문 — private 저장소에서만 사용할 것"))
     mail = imaplib.IMAP4_SSL("imap.naver.com", 993)
     mail.login(NAVER_EMAIL, NAVER_APP_PW)
     since = (datetime.now() - timedelta(days=DAYS)).strftime("%d-%b-%Y")
@@ -158,23 +190,26 @@ def main():
                 continue
             total += 1
             print(f"\n{'-'*72}")
-            print(f"From    : {decode_str(msg.get('From',''))}")
-            print(f"Subject : {decode_str(msg.get('Subject',''))}")
+            sender = decode_str(msg.get("From", ""))
+            # 발신 도메인은 파서 분기에 필요하므로 가리지 않는다.
+            domain = sender.split("@")[-1].strip(" <>") if "@" in sender else sender
+            print(f"From    : {domain if REDACT else sender}")
+            print(f"Subject : {show(decode_str(msg.get('Subject','')))}")
             print(f"Date    : {msg.get('Date','')}")
 
             plain, html = best_text(msg)
             if plain.strip():
                 print(f"\n📄 text/plain ({len(plain):,}자, 앞 1500):")
-                print(plain.strip()[:1500])
+                print(show(plain.strip()[:1500]))
             if html.strip():
                 js = find_js_vars(html)
                 if js:
                     print(f"\n🧩 임베드 JS 변수 {len(js)}개:")
                     for name, ln, preview in js:
-                        print(f"  - {name} ({ln:,}자): {preview[:300]}")
+                        print(f"  - {name} ({ln:,}자): {show(preview[:300])}")
                 stripped = strip_tags(html)
                 print(f"\n📄 text/html strip ({len(stripped):,}자, 앞 1500):")
-                print(stripped[:1500])
+                print(show(stripped[:1500]))
 
             for part in msg.walk():
                 fn = decode_str(part.get_filename() or "")
@@ -188,7 +223,7 @@ def main():
                     txt = try_pdf(payload, PDF_PW)
                     if txt:
                         print(f"  📜 PDF 텍스트 앞 2500:")
-                        print("\n".join("  " + l for l in txt[:2500].splitlines()))
+                        print("\n".join("  " + show(l) for l in txt[:2500].splitlines()))
 
     if not total:
         print(f"\n⚠️ '{FROM_FILTER}' 발신 메일 {DAYS}일 내 0건")
