@@ -721,7 +721,7 @@ def process_kakao_exports(mail, folders: list, dest_folders: dict) -> tuple:
                 transactions.extend(txs)
                 print(f"    → {len(txs)}건 추출")
             if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
-                if move_email(mail, eid, dest_folders["처리완료"]):
+                if defer_move(mail, folder, eid, dest_folders["처리완료"]):
                     moved += 1
 
         if ENABLE_EMAIL_CLEANUP:
@@ -835,7 +835,7 @@ def process_self_uploads(mail, folders: list, dest_folders: dict) -> tuple:
 
             # 한 건이라도 적재된 메일만 치운다 — 실패분은 남겨 재시도.
             if parsed_any and ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
-                if move_email(mail, eid, dest_folders["처리완료"]):
+                if defer_move(mail, folder, eid, dest_folders["처리완료"]):
                     moved += 1
 
         if ENABLE_EMAIL_CLEANUP:
@@ -1650,6 +1650,70 @@ def move_email(mail, eid, dest_encoded: str, mark_seen: bool = True) -> bool:
         return False
 
 
+# ── 거래 메일은 '저장 뒤에' 옮긴다 ─────────────────────
+# 예전엔 각 패스가 거래를 뽑자마자 메일을 처리완료로 옮겼다. 그 뒤 저장 전에
+# 프로세스가 죽으면(2026-10-20·21 cp949 출력 크래시) 메일은 치워지고 거래는
+# 사라진다 — 다음 실행이 다시 읽을 수도 없다. 그래서 거래가 든 메일은 이동을
+# '예약'만 하고, save_to_sheets가 끝난 뒤 flush_deferred_moves()로 옮긴다.
+# 저장 전에 죽으면 메일은 그대로 남아 다음 실행에서 다시 읽히고, 중복 키가
+# 이중 저장을 막는다. 순번(eid)은 정리 패스의 EXPUNGE로 바뀌므로 UID로 기억한다.
+_DEFERRED_MOVES: list = []  # [(폴더, UID, 대상 폴더)]
+
+
+def defer_move(mail, folder: str, eid, dest_encoded: str) -> bool:
+    """거래 메일을 저장 후 이동하도록 예약. 예약 성공 여부를 반환."""
+    try:
+        _, data = mail.fetch(eid, "(UID)")
+        raw = data[0] if data else b""
+        if isinstance(raw, tuple):
+            raw = raw[0]
+        m = re.search(rb"UID (\d+)", raw or b"")
+    except Exception as exc:
+        print(f"이동 예약 실패 (eid={eid}): {exc}")
+        return False
+    if not m:
+        print(f"이동 예약 실패 (eid={eid}): UID 없음")
+        return False
+    key = (folder, m.group(1).decode(), dest_encoded)
+    if key not in _DEFERRED_MOVES:
+        _DEFERRED_MOVES.append(key)
+    return True
+
+
+def flush_deferred_moves() -> int:
+    """예약된 거래 메일을 실제로 옮긴다. 반드시 저장이 끝난 뒤에 호출."""
+    if not _DEFERRED_MOVES:
+        return 0
+    by_folder: dict = {}
+    for folder, uid, dest in _DEFERRED_MOVES:
+        by_folder.setdefault(folder, []).append((uid, dest))
+    mail = connect_imap()
+    moved = 0
+    try:
+        for folder, items in by_folder.items():
+            if mail.select(f'"{folder}"', readonly=False)[0] != "OK":
+                print(f"처리완료 이동: 폴더 선택 실패 ({folder})")
+                continue
+            for uid, dest in items:
+                try:
+                    mail.uid("STORE", uid, "+FLAGS", "\\Seen")
+                    if mail.uid("COPY", uid, f'"{dest}"')[0] != "OK":
+                        print(f"처리완료 이동 실패 (uid={uid})")
+                        continue
+                    mail.uid("STORE", uid, "+FLAGS", "\\Deleted")
+                    moved += 1
+                except Exception as exc:
+                    print(f"처리완료 이동 실패 (uid={uid}): {exc}")
+            mail.expunge()
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+    _DEFERRED_MOVES.clear()
+    return moved
+
+
 def fetch_recent_ids(mail, folder: str, hours: int) -> list:
     """폴더에서 최근 N시간 이내 이메일 ID 리스트"""
     since = (datetime.now() - timedelta(hours=hours)).strftime("%d-%b-%Y")
@@ -1696,6 +1760,10 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict,
             continue
         if source == "KB카드" and is_statement_email(subject):
             continue
+        # 카뱅 '거래내역 엑셀' 내보내기도 전용 패스(process_kakao_exports) 몫.
+        # 거래 메일 이동을 저장 뒤로 미루므로, 한 메일은 한 패스만 읽어야 한다.
+        if source == "카카오뱅크" and is_kakao_export_email(subject):
+            continue
 
         # 은행/카드사 발신이지만 거래가 아닌 안내성 메일은 사전 차단
         if source and is_non_transaction_subject(subject):
@@ -1738,7 +1806,7 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict,
                 })
 
                 if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
-                    if move_email(mail, eid, dest_folders["처리완료"]):
+                    if defer_move(mail, folder, eid, dest_folders["처리완료"]):
                         moved["거래"] += 1
             except Exception as exc:
                 print(f"거래 파싱 실패 (eid={eid}): {exc}")
@@ -1872,7 +1940,7 @@ def process_kb_statements(mail, folders: list, dest_folders: dict) -> tuple:
                 transactions.extend(kb_txs)
                 print(f"    → {len(kb_txs)}건 추출 (소스: {chosen_label})")
                 if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
-                    if move_email(mail, eid, dest_folders["처리완료"]):
+                    if defer_move(mail, folder, eid, dest_folders["처리완료"]):
                         moved_count += 1
             else:
                 print("    → 추출 0건. KB HTML 포맷 변경 가능성, 로그 확인 필요")
@@ -1975,7 +2043,7 @@ def process_statements(mail, folders: list, dest_folders: dict) -> tuple:
                     transactions.extend(pdf_txs)
                     print(f"    → {len(pdf_txs)}건 추출 ({s_year}-{s_month:02d} 명세)")
                     if ENABLE_EMAIL_CLEANUP and "처리완료" in dest_folders:
-                        if move_email(mail, eid, dest_folders["처리완료"]):
+                        if defer_move(mail, folder, eid, dest_folders["처리완료"]):
                             moved_count += 1
                 else:
                     print("    → 추출 0건. PDF 포맷/비번 확인 필요")
@@ -2374,6 +2442,16 @@ def main():
         pass
 
     saved = save_to_sheets(all_transactions) or 0
+
+    # 저장이 끝난 뒤에야 거래 메일을 처리완료로 옮긴다. 여기서 실패해도 저장은
+    # 이미 끝났고, 메일은 남아 다음 실행이 다시 읽어 중복 키로 걸러진다.
+    if ENABLE_EMAIL_CLEANUP:
+        try:
+            n = flush_deferred_moves()
+            if n:
+                print(f"📦 저장 확인 후 처리완료로 이동: {n}건")
+        except Exception as exc:
+            print(f"처리완료 이동 실패 (저장은 완료, 다음 실행에 재시도): {exc}")
 
     # SMTP 요약 발신 — 저장/명세서 이벤트가 있을 때만 (월 몇 통 수준).
     # EMAIL_SUMMARY=false로 끌 수 있고, 발신 실패는 수집 결과에 영향 없음.

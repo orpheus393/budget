@@ -75,7 +75,91 @@ def main():
               "   네이버 > 내정보 > 보안설정 > 애플리케이션 비밀번호에서 새로 발급한 뒤\n"
               "   .streamlit/secrets.toml의 NAVER_APP_PW를 교체하세요.\n"
               "   교체 전까지 매일 수집은 아무것도 가져오지 못합니다.")
+
+    if result.returncode != 0:
+        notify_failure(output, log_path, env)
     sys.exit(result.returncode)
+
+
+# ── 실패 알림 ──────────────────────────────────────────
+# 작업 스케줄러로 돌면 실패해도 아무도 모른다(9/19 로그인 실패 18일, 10/20 cp949
+# 크래시 2일을 사람이 직접 들여다보고서야 알았다). 요약 메일은 성공 시에만 나간다.
+# 두 경로로 알린다:
+#   1) Windows 화면 알림 — 비밀번호 불필요, 네이버 로그인이 죽어도 뜬다.
+#      이 작업은 로그인 세션(Interactive)에서 돌기 때문에 화면에 보인다.
+#   2) 네이버 메일 — 폰에서도 보인다. 단 원인이 로그인 실패면 같은 앱 비밀번호를
+#      써서 함께 실패하므로, 이 경우는 1)이 유일한 알림이다.
+# 어느 쪽이 실패해도 수집 결과(종료 코드)는 바꾸지 않는다.
+
+def _failure_reason(output: str) -> str:
+    """로그에서 사람이 읽을 원인 한 줄."""
+    if "Authentication failed" in output:
+        return "네이버 로그인 실패 — 앱 비밀번호를 새로 발급해 secrets.toml을 교체하세요"
+    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    for l in reversed(lines):
+        if "Error" in l or "Exception" in l:
+            return l[:200]
+    return lines[-1][:200] if lines else "출력 없음"
+
+
+def _toast(title: str, body: str) -> bool:
+    """Windows 화면 알림. 한글·따옴표 문제를 피하려고 -EncodedCommand로 넘긴다."""
+    import base64
+
+    def esc(s: str) -> str:
+        return s.replace("'", "''")
+
+    ps = (
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
+        "ContentType = WindowsRuntime] > $null;"
+        "$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+        "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+        "$x = $t.GetElementsByTagName('text');"
+        f"$x.Item(0).AppendChild($t.CreateTextNode('{esc(title)}')) > $null;"
+        f"$x.Item(1).AppendChild($t.CreateTextNode('{esc(body)}')) > $null;"
+        "$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app)"
+        ".Show([Windows.UI.Notifications.ToastNotification]::new($t))"
+    )
+    enc = base64.b64encode(ps.encode("utf-16-le")).decode()
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-EncodedCommand", enc],
+                           capture_output=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _mail(subject: str, body: str, env: dict) -> bool:
+    import smtplib
+    from email.mime.text import MIMEText
+
+    user, pw = env.get("NAVER_EMAIL", ""), env.get("NAVER_APP_PW", "")
+    if not user or not pw:
+        return False
+    msg = MIMEText(body, _charset="utf-8")
+    msg["Subject"], msg["From"], msg["To"] = subject, user, user
+    try:
+        with smtplib.SMTP("smtp.naver.com", 587, timeout=30) as smtp:
+            smtp.starttls()
+            smtp.login(user, pw)
+            smtp.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+
+def notify_failure(output: str, log_path: str, env: dict) -> None:
+    reason = _failure_reason(output)
+    shown = _toast("가계부 수집 실패", reason)
+    sent = _mail(f"❗ [가계부] 수집 실패 {datetime.now():%m-%d %H:%M}",
+                 f"오늘 가계부 자동 수집이 실패했습니다.\n\n원인: {reason}\n\n"
+                 f"로그 파일: {log_path}\n\n"
+                 "거래 메일은 저장이 끝나야 옮겨지므로, 원인을 고치면 다음 수집이 "
+                 "빠진 분을 다시 읽습니다.", env)
+    print(f"🔔 실패 알림 — 화면: {'표시' if shown else '실패'}, 메일: {'발송' if sent else '실패'}")
+    if not (shown or sent):
+        print("⚠️ 알림 두 경로 모두 실패. 로그 파일을 직접 확인하세요.")
 
 
 if __name__ == "__main__":
