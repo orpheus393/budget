@@ -55,7 +55,8 @@ def main():
     print(f"📬 로컬 수집 시작 (lookback {env['LOOKBACK_HOURS']}h → {env['DB_PATH']})")
     result = subprocess.run(
         [sys.executable, os.path.join(REPO_ROOT, "scripts", "email_parser.py")],
-        env=env, cwd=REPO_ROOT, capture_output=True, text=True,
+        env={**env, "PYTHONIOENCODING": "utf-8"}, cwd=REPO_ROOT,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     output = (result.stdout or "") + (result.stderr or "")
     print(output, end="")

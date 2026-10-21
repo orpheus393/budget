@@ -2390,4 +2390,13 @@ def main():
 
 
 if __name__ == "__main__":
+    # 작업 스케줄러가 출력을 파이프로 받으면 한국어 Windows에선 stdout이 cp949가
+    # 되어 이모지(📬 등) print에서 UnicodeEncodeError로 죽는다. 그 지점이 메일을
+    # 처리완료로 옮긴 뒤·저장 전이라, 새 거래가 있으면 메일만 치워지고 데이터는
+    # 사라진다(2026-10-20·21 실제 발생). 출력 때문에 수집이 죽지 않게 막는다.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     main()
