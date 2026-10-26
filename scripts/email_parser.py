@@ -1660,8 +1660,8 @@ def move_email(mail, eid, dest_encoded: str, mark_seen: bool = True) -> bool:
 _DEFERRED_MOVES: list = []  # [(폴더, UID, 대상 폴더)]
 
 
-def defer_move(mail, folder: str, eid, dest_encoded: str) -> bool:
-    """거래 메일을 저장 후 이동하도록 예약. 예약 성공 여부를 반환."""
+def _uid_of(mail, eid):
+    """순번(eid) → UID 문자열. 못 읽으면 None."""
     try:
         _, data = mail.fetch(eid, "(UID)")
         raw = data[0] if data else b""
@@ -1669,12 +1669,31 @@ def defer_move(mail, folder: str, eid, dest_encoded: str) -> bool:
             raw = raw[0]
         m = re.search(rb"UID (\d+)", raw or b"")
     except Exception as exc:
-        print(f"이동 예약 실패 (eid={eid}): {exc}")
+        print(f"UID 조회 실패 (eid={eid}): {exc}")
+        return None
+    return m.group(1).decode() if m else None
+
+
+def _move_uid(mail, uid: str, dest_encoded: str) -> bool:
+    """현재 선택된 폴더에서 UID로 이동(읽음 → 복사 → 삭제 표시). EXPUNGE는 호출자."""
+    try:
+        mail.uid("STORE", uid, "+FLAGS", "\\Seen")
+        if mail.uid("COPY", uid, f'"{dest_encoded}"')[0] != "OK":
+            return False
+        mail.uid("STORE", uid, "+FLAGS", "\\Deleted")
+        return True
+    except Exception as exc:
+        print(f"이동 실패 (uid={uid}, dest={dest_encoded}): {exc}")
         return False
-    if not m:
+
+
+def defer_move(mail, folder: str, eid, dest_encoded: str) -> bool:
+    """거래 메일을 저장 후 이동하도록 예약. 예약 성공 여부를 반환."""
+    uid = _uid_of(mail, eid)
+    if not uid:
         print(f"이동 예약 실패 (eid={eid}): UID 없음")
         return False
-    key = (folder, m.group(1).decode(), dest_encoded)
+    key = (folder, uid, dest_encoded)
     if key not in _DEFERRED_MOVES:
         _DEFERRED_MOVES.append(key)
     return True
@@ -1695,15 +1714,8 @@ def flush_deferred_moves() -> int:
                 print(f"처리완료 이동: 폴더 선택 실패 ({folder})")
                 continue
             for uid, dest in items:
-                try:
-                    mail.uid("STORE", uid, "+FLAGS", "\\Seen")
-                    if mail.uid("COPY", uid, f'"{dest}"')[0] != "OK":
-                        print(f"처리완료 이동 실패 (uid={uid})")
-                        continue
-                    mail.uid("STORE", uid, "+FLAGS", "\\Deleted")
+                if _move_uid(mail, uid, dest):
                     moved += 1
-                except Exception as exc:
-                    print(f"처리완료 이동 실패 (uid={uid}): {exc}")
             mail.expunge()
     finally:
         try:
@@ -1736,6 +1748,7 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict,
     if not eids:
         return transactions, moved
 
+    pending_cleanup = []  # [(UID, 대상 폴더, 분류 폴더명, 제목)] — 루프 후 이동
     for eid in eids:
         try:
             _, msg_data = mail.fetch(eid, "(RFC822)")
@@ -1821,18 +1834,28 @@ def process_folder(mail, folder: str, hours: int, dest_folders: dict,
         encoded = dest_folders.get(category_folder)
         if not encoded:
             continue
-        # move_email은 mark_seen=True라 이동과 동시에 읽음 처리됨.
-        # 홍보(광고) 메일도 여기서 읽음+이동으로 함께 정리된다.
-        if move_email(mail, eid, encoded):
-            # 카운트 키 매핑 + 요약 로그 수집
-            for cat_name, folder_name, _, _ in NON_TX_CATEGORIES:
-                if folder_name == category_folder:
-                    moved[cat_name] = moved.get(cat_name, 0) + 1
-                    if cleanup_log is not None:
-                        cleanup_log.setdefault(cat_name, []).append(
-                            decode_str(subject).strip()[:60]
-                        )
-                    break
+        # 루프 도중에 옮기지 않는다. 네이버 IMAP은 폴더당 최근 1,000통만 보여주는데,
+        # 한 통 옮길 때마다 그 창이 줄어 끝 순번(=가장 최근 메일)이 사라졌다
+        # (매일 FETCH 실패 2~6건 = 그날 옮긴 수, 수집 직전 메일이 하루씩 지연).
+        # UID로 모아뒀다가 루프가 끝난 뒤 옮긴다. 순번으로 모으면 옮길 때마다
+        # 순번이 밀려 엉뚱한 메일을 옮기므로 반드시 UID.
+        uid = _uid_of(mail, eid)
+        if uid:
+            pending_cleanup.append((uid, encoded, category_folder, subject))
+
+    # 비거래 메일(쇼핑·광고 등) 일괄 이동 — 모든 메일을 다 읽은 뒤에.
+    # move_email처럼 읽음 처리도 함께 된다(홍보 메일 포함).
+    for uid, encoded, category_folder, subject in pending_cleanup:
+        if not _move_uid(mail, uid, encoded):
+            continue
+        for cat_name, folder_name, _, _ in NON_TX_CATEGORIES:
+            if folder_name == category_folder:
+                moved[cat_name] = moved.get(cat_name, 0) + 1
+                if cleanup_log is not None:
+                    cleanup_log.setdefault(cat_name, []).append(
+                        decode_str(subject).strip()[:60]
+                    )
+                break
 
     # EXPUNGE는 select가 풀린 후엔 무효 — 폴더별로 마지막에 호출
     if ENABLE_EMAIL_CLEANUP:

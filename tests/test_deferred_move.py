@@ -120,3 +120,95 @@ def test_reason_picks_last_error_line():
 
 def test_reason_empty_output():
     assert run_local_fetch._failure_reason("") == "출력 없음"
+
+
+# ── 네이버 '최근 1,000통' 창 축소로 최신 메일이 빠지던 문제 ─────────────
+class ShrinkingWindowMail:
+    """네이버 IMAP 흉내: 삭제 표시된 메일은 즉시 창에서 빠지고, 순번은 남은 메일
+    기준으로 다시 매겨진다. 범위를 벗어난 순번을 FETCH하면 [None]을 돌려준다
+    (실측: 'NoneType' object is not subscriptable)."""
+
+    def __init__(self, mails):
+        # mails: [(uid, from, subject)]
+        self.msgs = [{"uid": str(u), "raw": self._raw(f, s), "deleted": False}
+                     for u, f, s in mails]
+        self.none_fetches = 0
+        self.copied = []  # (uid, dest)
+
+    @staticmethod
+    def _raw(frm, subject):
+        from email.header import Header
+        return (f"From: {Header(frm, 'utf-8').encode()}\r\n"
+                f"Subject: {Header(subject, 'utf-8').encode()}\r\n"
+                "Date: Mon, 26 Oct 2026 08:00:00 +0900\r\n\r\nbody").encode()
+
+    def _visible(self):
+        return [m for m in self.msgs if not m["deleted"]]
+
+    def select(self, folder, readonly=False):
+        return "OK", [str(len(self._visible())).encode()]
+
+    def search(self, charset, criteria):
+        return "OK", [b" ".join(str(i + 1).encode() for i in range(len(self._visible())))]
+
+    def fetch(self, eid, what):
+        vis = self._visible()
+        i = int(eid) - 1
+        if i >= len(vis):
+            if "RFC822" in what:
+                self.none_fetches += 1
+            return "OK", [None]
+        m = vis[i]
+        if "UID" in what and "RFC822" not in what:
+            return "OK", [f"{eid.decode()} (UID {m['uid']})".encode()]
+        return "OK", [(f"{eid.decode()} (RFC822".encode(), m["raw"]), b")"]
+
+    def _by_seq(self, eid):
+        vis = self._visible()
+        i = int(eid) - 1
+        return vis[i] if i < len(vis) else None
+
+    def store(self, eid, op, flag):          # 순번 기반(옛 경로)
+        m = self._by_seq(eid)
+        if m and "Deleted" in flag:
+            m["deleted"] = True
+        return "OK", []
+
+    def copy(self, eid, dest):               # 순번 기반(옛 경로)
+        m = self._by_seq(eid)
+        if m:
+            self.copied.append((m["uid"], dest))
+        return "OK", []
+
+    def uid(self, cmd, uid, *a):
+        m = next((x for x in self.msgs if x["uid"] == uid and not x["deleted"]), None)
+        if m is None:
+            return "NO", []
+        if cmd == "COPY":
+            self.copied.append((uid, a[0]))
+        elif cmd == "STORE" and "Deleted" in a[-1]:
+            m["deleted"] = True
+        return "OK", []
+
+    def expunge(self):
+        return "OK", []
+
+
+def test_cleanup_moves_do_not_hide_newest_mails(monkeypatch):
+    """쇼핑 메일을 루프 도중 옮기면 창이 줄어 끝 순번(최신 메일)을 못 읽었다.
+    모든 메일을 다 읽은 뒤에 UID로 옮겨야 한다."""
+    monkeypatch.setattr(email_parser, "ENABLE_EMAIL_CLEANUP", True)
+    shop = ("쿠팡 <noreply@e.coupang.com>", "[쿠팡] 주문하신 내역을 확인해주세요")
+    other = ("친구 <friend@example.com>", "안녕")
+    m = ShrinkingWindowMail([
+        (101, *shop), (102, *shop), (103, *shop),     # 앞쪽 = 오래된 쇼핑 메일
+        (104, *other), (105, *other), (106, *other),  # 뒤쪽 = 가장 최근 메일
+    ])
+    dest = {"가계부_쇼핑": "SHOP"}
+    _, moved = email_parser.process_folder(m, "INBOX", 26, dest, {})
+
+    assert m.none_fetches == 0, f"최신 메일 {m.none_fetches}통을 못 읽었다"
+    assert moved["쇼핑"] == 3
+    assert sorted(m.copied) == [("101", '"SHOP"'), ("102", '"SHOP"'), ("103", '"SHOP"')], \
+        "쇼핑 메일만, 정확히 그 메일만 옮겨야 한다"
+    assert [x["uid"] for x in m._visible()] == ["104", "105", "106"]
